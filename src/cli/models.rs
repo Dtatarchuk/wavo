@@ -61,10 +61,8 @@ pub fn resolve(arg: &str) -> Result<Source> {
     .map(|n| (distance(arg, n), n))
     .min()
     .filter(|&(d, n)| d <= (n.len() / 3).max(2));
-  match closest {
-    Some((_, n)) => bail!("unknown model {arg:?}, did you mean {n}? Known models: {names}"),
-    None => bail!("unknown model {arg:?}. Known models: {names}"),
-  }
+  let hint = closest.map_or(".".into(), |(_, n)| format!(", did you mean {n}?"));
+  bail!("unknown model {arg:?}{hint} Known models: {names}")
 }
 
 /// Levenshtein distance.
