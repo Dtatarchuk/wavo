@@ -18,7 +18,6 @@ use models::Source;
 use wavo::hub::{self, Hub, MODELS};
 
 const USAGE: &str = "\
-<<<<<<< HEAD
 Usage: wavo COMMAND ...
 
 Commands:
