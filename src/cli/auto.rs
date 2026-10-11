@@ -10,9 +10,10 @@ use wavo::Language;
 /// Detects the language with this model.
 pub const DETECTOR: &str = "whisper-tiny";
 
-/// A language outside the person's own (and English) needs at least this probability. Picked on
-/// the reference samples and their 2–3 s cuts (`docs/plans/20261011-cli-ux.md`).
-const SURE: f32 = 0.8;
+/// The person's own languages and English count this many times their probability, so another
+/// language wins only when Whisper is far surer of it. Picked on the reference samples and their
+/// 2–3 s cuts (`docs/plans/20261011-cli-ux.md`).
+const OWN: f32 = 30.0;
 
 /// The model for a language: GigaAM for Russian, Parakeet for the 25 languages of v3, else
 /// Whisper.
@@ -28,20 +29,23 @@ pub fn model_for(code: &str) -> &'static str {
   }
 }
 
-/// The most likely language among `own` and English, unless one outside them is at least
-/// [`SURE`]. `ranked` is most likely first, as `Model::languages` returns it.
+/// The most likely language, favouring `own` and English. `ranked` is most likely first, as
+/// `Model::languages` returns it.
 pub fn choose<'a>(ranked: &'a [Language], own: &[String]) -> Option<&'a Language> {
   let i = pick(&ranked.iter().map(|l| (l.code.as_str(), l.probability)).collect::<Vec<_>>(), own);
   ranked.get(i?)
 }
 
-/// The index `choose` takes in `(code, probability)` pairs.
+/// The index `choose` takes in `(code, probability)` pairs: the highest probability, with the
+/// person's own languages and English weighted by [`OWN`]; the first of equals.
 fn pick(ranked: &[(&str, f32)], own: &[String]) -> Option<usize> {
-  let ours = |&(code, _): &(&str, f32)| code == "en" || own.iter().any(|o| o == code);
-  match ranked.first()? {
-    (_, p) if *p >= SURE => Some(0),
-    _ => Some(ranked.iter().position(ours).unwrap_or(0)),
-  }
+  let weight = |&(code, p): &(&str, f32)| {
+    if code == "en" || own.iter().any(|o| o == code) { p * OWN } else { p }
+  };
+  let best = |best: usize, (i, l): (usize, &(&str, f32))| {
+    if weight(l) > weight(&ranked[best]) { i } else { best }
+  };
+  (!ranked.is_empty()).then(|| ranked.iter().enumerate().fold(0, best))
 }
 
 /// The person's languages as two-letter codes: macOS preferred languages and keyboard layouts,
@@ -119,9 +123,10 @@ mod tests {
   fn choose_with_the_prior() {
     let own = ["uk".to_string()];
     assert_eq!(pick(&[("ru", 0.6), ("uk", 0.3), ("en", 0.1)], &own), Some(1));
-    assert_eq!(pick(&[("ru", 0.85), ("uk", 0.1)], &own), Some(0));
+    assert_eq!(pick(&[("ru", 0.98), ("uk", 0.01)], &own), Some(0)); // sure enough
     assert_eq!(pick(&[("nn", 0.7), ("de", 0.2), ("en", 0.1)], &own), Some(2));
-    assert_eq!(pick(&[("de", 0.7), ("fr", 0.3)], &own), Some(0)); // none of ours: Whisper's first
+    assert_eq!(pick(&[("ru", 0.6), ("de", 0.4), ("en", 0.001)], &own), Some(0)); // not ours
+    assert_eq!(pick(&[("de", 0.5), ("fr", 0.5)], &own), Some(0)); // the first of equals
     assert_eq!(pick(&[], &own), None);
   }
 
