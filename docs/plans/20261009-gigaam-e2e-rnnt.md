@@ -1,5 +1,7 @@
 # GigaAM v3 e2e-rnnt
 
+Done: 2026-10-09, commit afc44a2
+
 Roadmap phase 1: the first working model, matched exactly against the reference, plus a baseline
 benchmark. Follow `agents.md`. All three tasks land as one commit.
 
@@ -76,3 +78,11 @@ Sources: `3rd/transcribe.cpp/scripts/convert-gigaam.py` (tensor names and layout
 - [x] Check: `make check`; `make test`.
 
 After this, write the phase-2 speed plan from the measurements.
+
+## Result
+
+M2, wavo / `transcribe-bench` on Metal, ru / ru-short / ru-long, ms (MiB for the peak):
+
+- Warm median 45 / 102 / 340 vs 44 / 103 / 315; first call 71–84 / 131–135 / 372–388 vs 59–70 /
+  103–118 / 319–331; load 70 vs 130; peak footprint 878 / 880 / 925 vs 322 / 324 / 333.
+- Portable kernels only (Task 1): warm 85.1 / 203.1 / 808.4 vs 46.4 / 99.6 / 311.2, load 0.23 s.
