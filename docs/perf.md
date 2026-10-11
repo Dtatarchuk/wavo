@@ -270,9 +270,59 @@ tool at ~320% and a VM at ~155% of a core), so a sanity check only:
 
 - Warm and first call are 8–30% faster on all five. Load is slower for the small models (base
   103 vs 62 ms: wavo's fixed GPU setup and warm-up window) and for large-v3 (1009 vs 829 ms,
-  1.67 GB of weights); on par for medium. Not measured again on a quiet machine.
+  1.67 GB of weights); on par for medium. On a quiet machine only base was slower, by 9 ms; see
+  "Load time".
 - M1: the texts of tiny, base, small, tiny.en and base.en (18 clips, `wavo run --segment 0` with
   the M2's binary) equal the fixtures. N100 (mele): tiny and small fixtures pass.
+
+## Load time (2026-10-11)
+
+M2, load average 2–4, on `jfk`. Per model 7 rounds, each one fresh process of `wavo bench MODEL
+jfk.wav -n 1` for f663ede and for this state, and `transcribe-bench --warmup 0 --iters 1`,
+interleaved; medians. Cells are f663ede / now / reference, ms. The large-v3 row is a rerun: the
+first had a background burst (load 381 / 197 / 590).
+
+| Model | Load | First call | Load + first call |
+|---|---|---|---|
+| whisper-base | 67.5 / 33.0 / 71.3 | 126.5 / 131.6 / 176.5 | 195.1 / 166.3 / 246.7 |
+| whisper-small | 109.2 / 55.2 / 134.7 | 390.0 / 397.1 / 460.7 | 496.4 / 451.9 / 590.7 |
+| whisper-large-v3 | 334.1 / 168.0 / 532.8 | 1969 / 2037 / 2237 | 2304 / 2193 / 2763 |
+| whisper-large-v3-turbo | 217.4 / 104.7 / 297.5 | 1309 / 1331 / 1460 | 1524 / 1437 / 1756 |
+| GigaAM e2e-rnnt | 76.4 / 44.2 / 103.5 | 95.0 / 98.1 / 112.3 | 170.9 / 141.7 / 217.0 |
+| Parakeet TDT V3 | 166.1 / 89.0 / 244.9 | 148.3 / 166.5 / 223.3 | 314.4 / 255.6 / 467.9 |
+
+- The Whisper gap in the variants table above was the busy machine. Quiet, f663ede already
+  loaded faster than the reference except whisper-base (67–74 vs 65–71 ms). Memory pressure or
+  a cold page cache shows most on large-v3: single loads of ~750 ms, the upload 294 + 257 ms
+  instead of 64 + 94.
+- The reference's `load_ms` covers less than wavo's load: not its first GGUF parse
+  (`Loader::open` runs before the timer), and no Metal pipelines, which ggml compiles on first
+  use in the first call. wavo's load creates every pipeline and probes the fast ones.
+- Metal caches compiled pipelines across runs by shader source: the same binary at a new path
+  loads as fast (GigaAM 65.7 vs 65.4 ms). New shaders cost 0.2–0.4 s once (whisper-tiny's
+  386 ms above). The first run after boot also reads the GGUF from disk; not measured.
+
+Where the load goes, temporary timers, median of 5 runs, f663ede → now, ms:
+
+| Part | whisper-base | whisper-large-v3 |
+|---|---|---|
+| GGUF open | 8.4 → 1.3 | 8.7 → 1.4 |
+| Tokenizer | 0.9 → 1.9 | 1.0 → 2.0 |
+| Language tokens | 8.2 → 0.2 | 8.7 → 0.2 |
+| wgpu adapter and device | 10.2 → 10.0 | 10.8 → 10.3 |
+| Pipelines | 7.6 → 4.7 | 7.6 → 4.9 |
+| Fast-kernel probes | 4.9 → 2.5 | 5.5 → 2.4 |
+| Weight upload, encoder + decoder | 14.3 → 11.8 | 179.7 → 143.1 |
+| Decoder pipelines and warm-up window | 13.8 → 0 | 129.5 → 0 |
+| Total | 71.3 → 33.0 | 346.2 → 165.3 |
+
+- The adapter and device (7.4 + 2.6 ms) are Metal's device setup; the reference pays it inside
+  its `load_ms` too. The decoder pipelines (1.7 ms) are now compiled in the first call.
+- The upload is the floor for large models: ~10 GB/s, from one thread per block, through a
+  `read` from the page cache, after wgpu zeroes each buffer it maps at creation (`map_buffer` in
+  wgpu-core). The reference reads each tensor on one thread and copies it: ~3 GB/s.
+- Not done: compiling the pipelines while the weights upload (~7 ms, but every kernel lookup
+  would wait on a thread); starting the device while the GGUF header is read (≤ 3 ms left).
 
 ## Other engines (2026-10-10)
 
@@ -420,8 +470,8 @@ in 0.2–0.4 s while Metal compiles and caches the new shaders.
 
 How it runs: the GGUF header is read at load and each tensor is streamed from the file straight
 into weight buffers that are mapped on unified memory (no staging copy); weights stay Q8_0/F16
-on the GPU. With the fast kernels, load ends with an encoder run on 8 silent frames to pay the
-GPU's first use of pipelines and weights (the portable path skips it). Per call: CPU log-mel
+on the GPU. Load runs nothing on the GPU but the kernel probes: an encoder run on silent frames
+at load cost more than it saved in the first call (see "Load time"). Per call: CPU log-mel
 (own FFT, one frame at a time), then the encoder over an arena sized for the longest input so
 far, with bind groups cached per dispatch: one submission with the fast kernels, one per layer on
 the portable path (`Pass::layers`). Fast kernels (cooperative-matrix GEMM with Q8_0/F16 dequantized while
@@ -669,6 +719,35 @@ skip, NEON decoder) and the research list are done or rejected; see the Log.
 ## Log
 
 Add entries here, newest first: date, model, idea, before → after (median, A/B/A), verdict, why.
+
+- 2026-10-11, all models, no warm-up at load (an encoder run on 8 silent frames, for Whisper a
+  64-frame window and a decoder step). M2, load average 2–3, the previous entry (A) and this
+  (B), A/B/A interleaved per round, 7 rounds, `jfk`; load / first call / load + first, ms:
+  whisper-base 44.6 / 121.7 / 165.8 → 32.0 / 128.5 / 160.5 (second A 45.0 / 121.6 / 166.6),
+  small 76.1 / 368.6 / 444.7 → 49.1 / 381.9 / 431.6, large-v3 278.6 / 1976 / 2255 → 163.5 /
+  2016 / 2180, turbo 179.2 / 1309 / 1486 → 101.1 / 1328 / 1430, GigaAM e2e-rnnt 67.8 / 94.4 /
+  162.1 → 43.8 / 98.1 / 142.8, Parakeet V3 147.8 / 148.6 / 298.4 → 88.4 / 164.9 / 253.3; on `ru`
+  (4.5 s) GigaAM 70.1 / 44.5 / 114.5 → 46.5 / 50.1 / 96.5, Parakeet V3 150.1 / 72.0 / 222.8 →
+  95.8 / 83.9 / 179.9. Kept: load + first call is 5–89 ms lower on every model, the first call
+  4–40 ms higher. The warm-up cost 12–115 ms at load and saved the first call only 4–40: its
+  arena, sized for 8 frames, is allocated again by the first call, and since the 2026-10-09 entry
+  below (first call −41 ms for +12 ms of load) the weights are mapped and the kernels changed.
+
+- 2026-10-11, all models, load: four fixed costs and a copy (see "Load time"). M2, load average
+  3–6, `wavo bench -n 1` in a fresh process per sample, f663ede (A) and this (B) interleaved A/B/A
+  per round, 7 rounds (GigaAM 9), load median: whisper-base 67.1 / 43.3 / 66.6, small 105.2 /
+  72.6 / 105.4, large-v3 319.0 / 269.2 / 319.3, turbo 214.1 / 175.4 / 211.4, GigaAM e2e-rnnt 76.6
+  / 65.4 / 74.6, Parakeet V3 163.6 / 148.5 / 165.1 ms; first call unchanged, fixtures exact.
+  Kept. Per part (temporary timers, median of 5 runs):
+  - GGUF metadata decoded when read, not all at open: Whisper's 1.9 MB header holds 51,866
+    tokens, as many token types and 50,000 merges, ~150k values. Open 8.1 → 1.2 ms; reading the
+    tokens in the tokenizer 0.9 → 1.8 ms.
+  - Whisper's 99 language tokens searched from the end of the vocabulary, where the special
+    tokens are: 8.1 → 0.2 ms.
+  - Fast pipelines compiled on a second thread while the portable ones compile: 7.8 → 4.6 ms.
+  - The ten fast-kernel probes in one submission instead of one each: 4.7 → 2.5 ms.
+  - Q8_0 blocks written straight into the mapped buffers instead of through a scale and a data
+    `Vec` per 278 KB piece: large-v3 encoder + decoder upload 170 → 138 ms (8 runs interleaved).
 
 - 2026-10-10, build, own FFT (`src/fft.rs`, transcribe.cpp's radix-2 over odd DFT leaves in
   Stockham order, FMA on x86_64 when present) for all three frontends instead of `rustfft`.
