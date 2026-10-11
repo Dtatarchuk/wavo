@@ -31,19 +31,25 @@ fn read_wav(path: &Path) -> Vec<f32> {
   wav.samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect()
 }
 
-/// Text and `(piece, start ms)` tokens from a fixture: `text: ...`, `tokens: N`, then lines like
+/// Text and `(piece, start ms)` tokens from the block `## <sample>` of `tests/fixtures/<name>.txt`,
+/// its lines up to the next header: `text: ...`, `tokens: N`, then lines like
 /// `  [   0.96 ->    1.00] p=0.000 ▁В`, or only `text: (empty)`. Pieces come with `▁` as a space,
 /// as the reference prints some of them. Whisper fixtures have `segments: N` and lines
-/// `  [   0.00 ->   10.40] text` instead: then the pairs are segment texts and starts.
-fn read_fixture(path: &Path) -> (String, Vec<(String, u32)>, bool) {
-  let fixture = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
-  let mut lines = fixture.lines();
+/// `  [   0.00 ->   10.40] text` instead: then the pairs are segment texts and starts. A block with
+/// only a non-empty `text: ...` checks the text alone: no tokens.
+fn read_fixture(name: &str, sample: &str) -> (String, Option<Vec<(String, u32)>>, bool) {
+  let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}.txt"));
+  let fixture = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+  let header = format!("## {sample}");
+  let mut lines = fixture.lines().skip_while(|l| *l != header);
+  assert!(lines.next().is_some(), "{path:?}: no {header}");
+  let mut lines = lines.take_while(|l| !l.starts_with("## ")).filter(|l| !l.is_empty());
   let text = lines.next().and_then(|l| l.strip_prefix("text: ")).expect("text line");
   if text == "(empty)" {
     assert!(lines.next().is_none(), "{path:?}: tokens after an empty text");
-    return (String::new(), Vec::new(), false);
+    return (String::new(), Some(Vec::new()), false);
   }
-  let head = lines.next().expect("tokens or segments line");
+  let Some(head) = lines.next() else { return (text.to_string(), None, false) };
   let (count, segments) = match head.strip_prefix("segments: ") {
     Some(count) => (count, true),
     None => (head.strip_prefix("tokens: ").expect("tokens line"), false),
@@ -58,7 +64,7 @@ fn read_fixture(path: &Path) -> (String, Vec<(String, u32)>, bool) {
     })
     .collect();
   assert_eq!(tokens.len(), count, "{path:?}: token count");
-  (text.to_string(), tokens, segments)
+  (text.to_string(), Some(tokens), segments)
 }
 
 fn check(name: &str, samples: &[&str]) {
@@ -67,10 +73,10 @@ fn check(name: &str, samples: &[&str]) {
   let model = wavo::Model::load(model_path(name)).unwrap();
   for sample in samples {
     let pcm = read_wav(&root.join(format!("3rd/transcribe.cpp/samples/{sample}.wav")));
-    let fixture = root.join(format!("tests/fixtures/{name}/{sample}.txt"));
-    let (text, tokens, segments) = read_fixture(&fixture);
+    let (text, tokens, segments) = read_fixture(name, sample);
     let got = model.transcribe(&pcm).unwrap();
     assert_eq!(got.text, text, "{name} {sample}: text");
+    let Some(tokens) = tokens else { continue };
     let mut got: Vec<(String, u32)> =
       got.tokens.into_iter().map(|t| (t.piece.replace('▁', " "), t.start_ms)).collect();
     if segments {
