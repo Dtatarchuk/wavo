@@ -68,6 +68,11 @@ GigaAM:
 
 Parakeet: conv_glu's depthwise taps as [tap][ch] (≤ 2% of GPU time, shared with GigaAM); GEMM tile
 shapes at M = 138 (1.5 vs 1.8 TFLOP/s at M = 442 before the f16 64×64 GEMM; re-profile first).
+FluidAudio on Core ML's GPU path (F16 activations, 6-bit weights) runs V3 end to end in 8–15%
+less time than wavo (jfk 134 vs 145, dots 372 vs 437 ms); its encoder alone takes 103 ms per 15 s
+window: time wavo's encoder on the same window to find the gap. An opt-in ANE backend for the
+Conformer families (31 ms per window, a third of the energy) is costed in [Other
+engines](plans/20261010-other-engines.md).
 
 Whisper, open in [the Whisper plan](plans/completed/20261010-whisper.md) (Task 6): decoder gemv bandwidth
 against ~100 GB/s, LayerNorm folded into the next gemv, the two prompt tokens as one two-row step,
@@ -477,10 +482,13 @@ plus first call.
 
 Numbers are in the plans' "## Result" sections.
 
+- 2026-10-11, Parakeet V3 and Whisper turbo against Neural Engine engines: FluidAudio (ANE) is
+  2.2–2.3× faster than wavo on 11–35 s at a third of the energy; WhisperKit (ANE) is 1.4–1.8×
+  slower at ~15% more energy; parakeet-mlx 1.7–1.8× slower on 11–35 s. [Other
+  engines](plans/20261010-other-engines.md).
 - 2026-10-11, Windows RTX 4060, GPU timestamps around the 16×16 GEMM: the portable GEMMs were 50%
   of the kernels on turbo `jfk` and 75% on Parakeet V3 `dots`; after it attention is 74% on turbo
   (471 of 633 ms). [16×16 GEMM plan](plans/completed/20261011-nvidia-fast.md).
-
 - 2026-10-11, Whisper variants, baseline: on the M2 8–30% faster than the reference; on Windows
   the portable encoder is 1.5–3.4× behind the reference's cooperative matrices from base on.
   [Whisper plan](plans/completed/20261010-whisper.md).

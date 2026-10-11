@@ -120,9 +120,9 @@ the `Makefile` and `.github/workflows/main.yml`.
 - Every change reaches `main` through a pull request, one per feature or roadmap phase:
   1. Agree the plan with the person. For multi-step work keep a checklist in
      `docs/plans/yyyymmdd-<name>.md` and during the work only tick its checkboxes, with no
-     progress prose. When finished, add a first line `Done: yyyy-mm-dd, PR #N` and a short final
-     `## Result` section with the key numbers, and move it to `docs/plans/completed/` (fixing
-     links to it). Plans stay; never delete them.
+     progress prose. The PR that finishes the plan's last item, in its own commits, adds a first
+     line `Done: yyyy-mm-dd, PR #N` and a short final `## Result` section with the key numbers,
+     and moves it to `docs/plans/completed/` (fixing links to it). Plans stay; never delete them.
   2. Branch from `main` as `feat/<name>`, in the agent's own git worktree. A small change that
      fits an open PR's topic goes into that PR instead of a new one: docs-only edits join the open
      docs PR.
@@ -134,8 +134,10 @@ the `Makefile` and `.github/workflows/main.yml`.
      the PR is clean, then hands it to the person. CI runs only the smallest model of each family,
      so `make test` and benchmarks stay local. Copilot reviews every PR: fix what is right, answer
      the rest in the thread. Once the orchestrator accepts the solution, the implementing agent
-     runs `codex -C <worktree> review --base origin/main -c model_reasoning_effort=xhigh` if
-     available and fixes or rejects each finding with a reason; the orchestrator checks that last
+     runs `codex -C <worktree> review -c model_reasoning_effort=xhigh "Review the changes on the
+     current branch against origin/main (git diff origin/main...HEAD). Do not run GPU tests or
+     benchmarks; they were run."` if available (`--base` can't be combined with a prompt; the GPU
+     is shared) and fixes or rejects each finding with a reason; the orchestrator checks that last
      diff before handing the PR over.
   6. The person does the final review and squash-merges. Never commit or push to `main` directly.
   7. On conflicts, rebase onto `main`, rerun the checks and push with `--force-with-lease`.
