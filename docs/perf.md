@@ -49,6 +49,15 @@ pass per token (gemv on Q8_0 rows, attention over the F16 self and cross caches,
 the vocabulary), and reads the logits back; suppression, timestamp rules, argmax, language and
 no-speech run on the CPU, and windows advance as the reference's seek loop.
 
+**Moonshine.** No frontend: the whole input in one pass, with the arena and the rotary table
+(computed on the CPU) sized for the longest input so far. One submission (one per layer on the
+portable path) holds the conv stem over the raw samples (im2col and GEMM with tanh, a one-workgroup
+GroupNorm, two more convs with GELU), the shared pre-LN blocks of `src/transformer.rs` with rotary
+q and k and portable attention (heads of 36 and 52 dims), the cross `[K | V]` packed into F16
+caches, and the `<s>` step. The decoder is Whisper's step on the GPU with SwiGLU and rotary q and
+k, ending in an argmax, so a token reads back 4 bytes; EOS, the 194-position cap and the
+repetition guard run on the CPU.
+
 ## Not tried yet
 
 GigaAM:
@@ -226,6 +235,10 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### Attention
 
+- 2026-10-11, Whisper and Moonshine, decoder `attend` in blocks of 2048 keys with an online
+  softmax, so cross-attention takes any length (Moonshine runs one pass over the whole input):
+  bit-identical up to 2048 keys; whisper-tiny `jfk` on the RTX 4060 50.0 / 51.2 / 51.5 ms on main,
+  51.4 / 51.3 with it. Kept.
 - 2026-10-10, Whisper and GigaAM, flash attention with the output in registers, 9.5 KB shared:
   Whisper jfk 1550 → 1403, GigaAM ru-long 297 → 276 ms, Parakeet unchanged; fixtures exact. Kept.
 - 2026-10-10, Parakeet V2 and GigaAM, one flash kernel for both attentions. One layout (one
@@ -486,6 +499,9 @@ Numbers are in the plans' "## Result" sections.
   2.2–2.3× faster than wavo on 11–35 s at a third of the energy; WhisperKit (ANE) is 1.4–1.8×
   slower at ~15% more energy; parakeet-mlx 1.7–1.8× slower on 11–35 s. [Other
   engines](plans/20261010-other-engines.md).
+- 2026-10-11, Moonshine tiny and base, baseline: fixtures exact on the first run with F16 caches;
+  warm 1.7–3.4× faster than the reference's faster backend on a busy M2, faster on the RTX 4060
+  but for base `dots` (228 vs 227 ms). [Moonshine plan](plans/20261011-moonshine.md)
 - 2026-10-11, Windows RTX 4060, GPU timestamps around the 16×16 GEMM: the portable GEMMs were 50%
   of the kernels on turbo `jfk` and 75% on Parakeet V3 `dots`; after it attention is 74% on turbo
   (471 of 633 ms). [16×16 GEMM plan](plans/completed/20261011-nvidia-fast.md).
