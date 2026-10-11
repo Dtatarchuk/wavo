@@ -70,12 +70,14 @@ is `parakeet-tdt-0.6b-v2`, `gigaam-v3` is `gigaam-v3-e2e-rnnt`, `whisper-turbo` 
 
 ## 📥 Installation
 
+Download the binary for macOS (Apple Silicon), Linux or Windows from the
+[latest release](https://github.com/vladkens/wavo/releases/latest) and put `wavo` (`wavo.exe`)
+into a folder on your `PATH`, such as `~/.local/bin`. Or build it with Rust, which takes a few
+minutes:
+
 ```sh
 cargo install wavo
 ```
-
-Or take prebuilt dev binaries for macOS, Linux and Windows from the
-[dev release](https://github.com/vladkens/wavo/releases/tag/dev).
 
 <details>
 <summary>Linux</summary>
@@ -109,6 +111,15 @@ from matrix multiplication on NVIDIA's tensor cores: an RTX 4060 laptop transcri
 audio in 42 ms (`gigaam-v3`), 79 ms (`parakeet-v3`) or 0.65 s (`whisper-turbo`).
 
 </details>
+
+### Newest version
+
+This readme follows main, which may be ahead of the latest release. Binaries of main are in the
+[dev release](https://github.com/vladkens/wavo/releases/tag/dev), or build it with Rust:
+
+```sh
+cargo install --git https://github.com/vladkens/wavo
+```
 
 ## 🚀 Usage
 
