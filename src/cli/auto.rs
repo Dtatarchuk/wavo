@@ -12,7 +12,7 @@ pub const DETECTOR: &str = "whisper-tiny";
 
 /// The person's own languages and English count this many times their probability, so another
 /// language wins only when Whisper is far surer of it. Picked on the reference samples and their
-/// 2–3 s cuts (`docs/plans/20261011-cli-ux.md`).
+/// 2–3 s cuts (`docs/plans/completed/20261011-cli-ux.md`).
 const OWN: f32 = 30.0;
 
 /// The model for a language: GigaAM for Russian, Parakeet for the 25 languages of v3, else
