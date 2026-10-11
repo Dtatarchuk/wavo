@@ -82,31 +82,38 @@ impl Kernels {
   }
 }
 
-/// The fast GEMMs (per weight type 32- and 64-row tiles), LayerNorm, conv_glu, flash attention and
-/// relative attention, before their probes.
-type FastPipelines = (Vec<Pipeline>, [Pipeline; 4]);
+/// The fast GEMMs (per weight type 4F- and 8F-row tiles), LayerNorm, conv_glu, flash attention and
+/// relative attention, before their probes. Only the GEMM runs with F = 16: the flash kernels need
+/// 8×8 F32 matrices, and on an RTX 4060 the fast LayerNorm and conv_glu were slower.
+type FastPipelines = (Vec<Pipeline>, [Option<Pipeline>; 4]);
 
-/// Compiles the fast kernels; `None` if any fails.
-fn compile_fast(device: &wgpu::Device) -> Option<FastPipelines> {
+/// Compiles the fast kernels for F×F cooperative matrices; `None` if any fails.
+fn compile_fast(device: &wgpu::Device, f: usize) -> Option<FastPipelines> {
   // Error scopes are per thread.
   let scopes = [wgpu::ErrorFilter::Internal, wgpu::ErrorFilter::Validation]
     .map(|f| device.push_error_scope(f));
-  let gemm = module(device, include_str!("gemm_fast.wgsl"));
-  let ops = module(device, include_str!("ops_fast.wgsl"));
-  let relative = module(device, include_str!("attention_fast.wgsl"));
-  let flash = module(device, include_str!("flash.wgsl"));
+  let source = include_str!("gemm_fast.wgsl")
+    .replace("F: u32 = 8u", &format!("F: u32 = {f}u"))
+    .replace("8x8", &format!("{f}x{f}"));
+  let gemm = module(device, &source);
   let gemm: Vec<_> = (0..6)
     .map(|i| {
-      let constants = [("WTYPE", (i / 2) as f64), ("ROWS", (32 << (i % 2)) as f64)];
+      let constants = [("WTYPE", (i / 2) as f64), ("ROWS", ((4 * f) << (i % 2)) as f64)];
       pipeline(device, &gemm, "gemm", &constants)
     })
     .collect();
-  let kernels = [
-    pipeline(device, &ops, "layer_norm", &[]),
-    pipeline(device, &ops, "conv_glu", &[]),
-    pipeline(device, &flash, "flash", &[]),
-    pipeline(device, &relative, "attention", &[]),
-  ];
+  let kernels = (f == 8).then(|| {
+    let ops = module(device, include_str!("ops_fast.wgsl"));
+    let relative = module(device, include_str!("attention_fast.wgsl"));
+    let flash = module(device, include_str!("flash.wgsl"));
+    [
+      pipeline(device, &ops, "layer_norm", &[]),
+      pipeline(device, &ops, "conv_glu", &[]),
+      pipeline(device, &flash, "flash", &[]),
+      pipeline(device, &relative, "attention", &[]),
+    ]
+  });
+  let kernels = kernels.map(|k| k.map(Some)).unwrap_or_default();
   let errors = scopes.into_iter().rev().filter_map(|s| pollster::block_on(s.pop())).count();
   (errors == 0).then_some((gemm, kernels))
 }
@@ -121,6 +128,8 @@ struct Decoder {
 
 #[derive(Default)]
 struct Fast {
+  /// F of the GEMM's F×F cooperative matrices: 8 (Apple) or 16; 0 without the fast GEMM.
+  size: usize,
   gemm: Option<Vec<Pipeline>>,
   layer_norm: Option<Pipeline>,
   conv_glu: Option<Pipeline>,
@@ -196,7 +205,8 @@ impl Gpu {
   /// The device with the fast kernels that pass their probes, or only the portable ones.
   pub fn new(fast: bool) -> Result<Self> {
     let adapter = adapter()?;
-    let fast = fast && offers_fast(&adapter);
+    let size = if fast { fast_size(&adapter) } else { None };
+    let fast = size.is_some();
     let mappable = adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu
       && adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
     let mut features = wgpu::Features::IMMEDIATES;
@@ -235,7 +245,7 @@ impl Gpu {
 
     // The fast kernels compile on a second thread meanwhile.
     let (kernels, compiled) = std::thread::scope(|s| {
-      let compiled = s.spawn(|| if fast { compile_fast(&device) } else { None });
+      let compiled = s.spawn(|| size.and_then(|f| compile_fast(&device, f)));
       (Kernels::new(&device), compiled.join().unwrap())
     });
     let mut weights = wgpu::BufferUsages::STORAGE;
@@ -265,8 +275,8 @@ impl Gpu {
       calls: Mutex::new(0),
       failure,
     };
-    if let Some(compiled) = compiled {
-      gpu.fast = gpu.probe(compiled);
+    if let (Some(size), Some(compiled)) = (size, compiled) {
+      gpu.fast = gpu.probe(size, compiled);
     }
     Ok(gpu)
   }
@@ -274,10 +284,10 @@ impl Gpu {
   /// Keeps each fast kernel whose probe reports its subgroup layout. With all params zero a
   /// kernel sees an empty problem and writes its layout, `subgroups` of 32 lanes, to its output.
   /// The probes run in one submission; a device error turns them all off.
-  fn probe(&self, compiled: FastPipelines) -> Fast {
+  fn probe(&self, size: usize, compiled: FastPipelines) -> Fast {
     let (gemm, [layer_norm, conv_glu, attention, relative]) = compiled;
     // Per kernel: bindings, the output's, params and subgroups.
-    let mut probes: Vec<_> = gemm.into_iter().map(|k| (k, 5, 2, 6, 4.0)).collect();
+    let mut probes: Vec<_> = gemm.into_iter().map(|k| (Some(k), 5, 2, 6, 4.0)).collect();
     probes.extend([
       (layer_norm, 6, 3, 4, 4.0),
       (conv_glu, 6, 5, 6, 4.0),
@@ -290,7 +300,9 @@ impl Gpu {
     let outs: Vec<Buffer> = (probes.iter())
       .map(|(k, bindings, out, params, _)| {
         let mut buffers: Vec<Buffer> = (0..*bindings).map(|_| self.buffer(16)).collect();
-        p.run(k, &buffers.iter().collect::<Vec<_>>(), &[0; 8][..*params], [1, 1, 1]);
+        if let Some(k) = k {
+          p.run(k, &buffers.iter().collect::<Vec<_>>(), &[0; 8][..*params], [1, 1, 1]);
+        }
         buffers.swap_remove(*out)
       })
       .collect();
@@ -308,13 +320,15 @@ impl Gpu {
     let range = mapped.then(|| read.slice(..).get_mapped_range().ok()).flatten();
     let got: Vec<f32> = range.map(|r| bytemuck::cast_slice(&r).to_vec()).unwrap_or_default();
     let mut kept = (probes.into_iter().enumerate()).map(|(i, (k, .., subgroups))| {
-      (got.get(2 * i..2 * i + 2) == Some(&[32.0, subgroups][..])).then_some(k)
+      k.filter(|_| got.get(2 * i..2 * i + 2) == Some(&[32.0, subgroups][..]))
     });
     let mut next = || kept.next().flatten();
     // All six GEMMs are taken before any is checked, so the kernels after them stay in place.
     let gemm: Vec<_> = (0..6).map(|_| next()).collect();
+    let gemm: Option<Vec<_>> = gemm.into_iter().collect();
     Fast {
-      gemm: gemm.into_iter().collect(),
+      size: if gemm.is_some() { size } else { 0 },
+      gemm,
       layer_norm: next(),
       conv_glu: next(),
       attention: next(),
@@ -475,6 +489,20 @@ impl Gpu {
     })
   }
 
+  /// The rows of the fast GEMM's tile for `m` rows of `n` outputs, or `None` for the portable GEMM.
+  fn tile_rows(&self, n: usize, m: usize) -> Option<usize> {
+    self.fast.gemm.as_ref()?;
+    let short = 4 * self.fast.size;
+    let (cols, m8, m4) = (n.div_ceil(2 * short), m.div_ceil(2 * short), m.div_ceil(short));
+    // Tiles 128 wide (F = 16) in fewer than 16 workgroups ran slower than the portable 64×64 ones
+    // on an RTX 4060: GigaAM's 768-wide layers at 113 rows, 12 workgroups, by 1.5×.
+    if short == 64 && cols * m4 < 16 {
+      return None;
+    }
+    // 8F-row tiles unless they leave few workgroups or pad more rows than 4F-row ones.
+    Some(if m8 * cols >= 64 && m8 * 20 <= m4 * 11 { 2 * short } else { short })
+  }
+
   fn flash(&self, head_dim: usize, relative: bool) -> Option<&Pipeline> {
     let (k, min, max) =
       if relative { (&self.fast.relative, 8, 128) } else { (&self.fast.attention, 32, 64) };
@@ -571,22 +599,30 @@ fn adapter() -> Result<wgpu::Adapter> {
   }))?)
 }
 
-/// Whether `adapter` has what the fast kernels need: 8×8 cooperative matrices of F32 and of F16
-/// into F32, and 32-lane subgroups. Apple GPUs do; Vulkan drivers so far offer F16/int8 matrices
-/// at best.
-fn offers_fast(adapter: &wgpu::Adapter) -> bool {
+/// F of the F×F cooperative matrices the fast kernels use on `adapter`, which needs 32-lane
+/// subgroups: 8 with 8×8 matrices of F32 and of F16 into F32 (Apple GPUs; all fast kernels), else
+/// 16 with 16×16 F16 into F32 (only the GEMM), on NVIDIA only so far. AMD's Windows driver
+/// (25.10, Radeon 610M) reports the same 16×16 shape but crashes the process while compiling any
+/// shader that uses it, which no probe can catch; other drivers are untested.
+fn fast_size(adapter: &wgpu::Adapter) -> Option<usize> {
   use wgpu::CooperativeScalarType::{F16, F32};
   let info = adapter.get_info();
   let matrices = adapter.cooperative_matrix_properties();
-  let has = |ab| {
-    matrices
-      .iter()
-      .any(|p| (p.m_size, p.n_size, p.k_size, p.ab_type, p.cr_type) == (8, 8, 8, ab, F32))
+  let has = |f, ab| {
+    let shape = (f, f, f, ab, F32);
+    matrices.iter().any(|p| (p.m_size, p.n_size, p.k_size, p.ab_type, p.cr_type) == shape)
   };
-  adapter.features().contains(COOP)
-    && (info.subgroup_min_size..=info.subgroup_max_size).contains(&32)
-    && has(F32)
-    && has(F16)
+  if !adapter.features().contains(COOP)
+    || !(info.subgroup_min_size..=info.subgroup_max_size).contains(&32)
+  {
+    return None;
+  }
+  const NVIDIA: u32 = 0x10de;
+  if has(8, F32) && has(8, F16) {
+    Some(8)
+  } else {
+    (has(16, F16) && info.vendor == NVIDIA).then_some(16)
+  }
 }
 
 fn module(device: &wgpu::Device, source: &str) -> wgpu::ShaderModule {
@@ -652,10 +688,10 @@ impl<'a> Pass<'a> {
   /// Submits the work recorded so far, marked done once `after` is written, and waits for the
   /// submission before it. A driver may cancel a long request (i915 20 s after it was queued,
   /// while a slow GPU runs a minute of Parakeet for longer), so each request is short and at
-  /// most two are queued. Errors show in `Gpu::run`'s last poll. With the fast kernels (Apple) a
-  /// call stays one submission: splitting costs ~1% there, and a 20 s call ran fine.
+  /// most two are queued. Errors show in `Gpu::run`'s last poll. With Apple's fast kernels (F = 8)
+  /// a call stays one submission: splitting costs ~1% there, and a 20 s call ran fine.
   fn flush(&mut self, after: &Buffer) {
-    if self.gpu.fast.gemm.is_some() {
+    if self.gpu.fast.size == 8 {
       return;
     }
     self.mark(after);
@@ -725,15 +761,18 @@ impl<'a> Pass<'a> {
     let params = [m as u32, l.n as u32, l.k as u32, mode, alpha, l.dual as u32];
     // Only Q8_0 reads scales; other types bind the bias in their place.
     let buffers = [a, &l.bias, c, &l.weight, l.scales.as_ref().unwrap_or(&l.bias)];
-    match &gpu.fast.gemm {
-      Some(k) => {
-        // 64-row tiles unless they leave few workgroups or pad more rows than 32-row ones.
-        let (m64, m32) = (m.div_ceil(64), m.div_ceil(32));
-        let tall = m64 * l.n / 64 >= 64 && m64 * 20 <= m32 * 11;
-        let rows = if tall { 64 } else { 32 };
-        self.run(&k[2 * l.ty + tall as usize], &buffers, &params, [l.n / 64, m.div_ceil(rows), 1])
+    let f = gpu.fast.size;
+    match (&gpu.fast.gemm, gpu.tile_rows(l.n, m)) {
+      (Some(k), Some(rows)) => {
+        let tall = rows > 4 * f;
+        self.run(
+          &k[2 * l.ty + tall as usize],
+          &buffers,
+          &params,
+          [l.n.div_ceil(8 * f), m.div_ceil(rows), 1],
+        )
       }
-      None => self.run(&gpu.kernels.gemm[l.ty], &buffers, &params, [l.n / 64, m.div_ceil(64), 1]),
+      _ => self.run(&gpu.kernels.gemm[l.ty], &buffers, &params, [l.n / 64, m.div_ceil(64), 1]),
     }
   }
 
@@ -917,9 +956,10 @@ mod tests {
       let fast = Gpu::new(true).unwrap();
       let f = &fast.fast;
       let ops = [&f.layer_norm, &f.conv_glu, &f.attention, &f.relative];
-      if offers_fast(&adapter().unwrap()) {
+      // With 16×16 matrices only the GEMM.
+      if let Some(size) = fast_size(&adapter().unwrap()) {
         assert!(
-          f.gemm.is_some() && ops.iter().all(|k| k.is_some()),
+          f.gemm.is_some() && ops.iter().all(|k| k.is_some() == (size == 8)),
           "a fast kernel failed its probe"
         );
       }
@@ -1019,12 +1059,26 @@ mod tests {
   }
 
   #[test]
+  fn failed_gemm_probe() {
+    // A GEMM that fails its probe turns the fast GEMM off and leaves the kernels after it in place.
+    let gpu = &gpus()[1];
+    let Some(size) = fast_size(&adapter().unwrap()) else { return };
+    let (mut gemm, kernels) = compile_fast(&gpu.device, size).unwrap();
+    // The portable GEMM writes nothing for m = 0.
+    gemm[0] = gpu.kernels.gemm[0].clone();
+    let fast = gpu.probe(size, (gemm, kernels.clone()));
+    assert!(fast.gemm.is_none() && fast.size == 0);
+    assert!([fast.layer_norm, fast.conv_glu, fast.attention, fast.relative] == kernels);
+  }
+
+  #[test]
   fn gemm() {
-    // 100 rows: the GEMM pads them to 128 output columns, which come out as epilogue(0).
-    let (n, k) = (100, 96);
+    // 164 rows: the GEMM pads them to 192 output columns, which come out as epilogue(0); a
+    // 128-wide tile of the fast GEMM passes them.
+    let (n, k, padded) = (164, 96, 192);
     let w = random(n * k, 1);
     let bias = random(n, 2);
-    // 64 more biases: the first 64 outputs again at columns 128.., with no epilogue.
+    // 64 more biases: the first 64 outputs again at columns 192.., with no epilogue.
     let dual: Vec<f32> = bias.iter().copied().chain(random(64, 5)).collect();
     let f32s: &[u8] = bytemuck::cast_slice(&w);
     let f16s: Vec<u8> = w.iter().flat_map(|x| f16::from_f32(*x).to_le_bytes()).collect();
@@ -1048,16 +1102,16 @@ mod tests {
       let wf: Vec<f32> = wf.iter().map(half).collect();
       // With the bias, without (zeros), and with dual outputs.
       for b in [&bias[..], &[], &dual] {
-        let width = if b.len() > n { 192 } else { 128 };
+        let width = if b.len() > n { padded + 64 } else { padded };
         for gpu in gpus() {
           let l = gpu.linear(&[t("w1"), t("w2")], b).unwrap();
           assert_eq!(l.width(), width);
-          // 2100 rows take the fast path's 64-row tiles.
+          // 2100 rows take the fast path's 8F-row tiles.
           for m in [1, 37, 70, 2100] {
             let a = random(m * k, 3);
             // The fast GEMM rounds a to f16 as well.
-            let ar: Vec<f32> =
-              if gpu.fast.gemm.is_some() { a.iter().map(half).collect() } else { a.clone() };
+            let fast = gpu.tile_rows(padded, m).is_some();
+            let ar: Vec<f32> = if fast { a.iter().map(half).collect() } else { a.clone() };
             let c = random(m * width, 4);
             let ab = up(gpu, &a);
             for e in epilogues {
@@ -1065,8 +1119,8 @@ mod tests {
                 .map(|i| {
                   let (r, j) = (i / width, i % width);
                   let dot = |j: usize| (0..k).map(|x| ar[r * k + x] * wf[j * k + x]).sum::<f32>();
-                  if j >= 128 {
-                    return b[n + j - 128] + dot(j - 128);
+                  if j >= padded {
+                    return b[n + j - padded] + dot(j - padded);
                   }
                   let v = if j < n { b.get(j).unwrap_or(&0.0) + dot(j) } else { 0.0 };
                   epilogue(e, v, c[i])
@@ -1145,8 +1199,8 @@ mod tests {
       for gpu in gpus() {
         assert!(gpu.linear(std::slice::from_ref(&t), &[]).is_err());
         let l = gpu.conv(file.tensor("w", &[k, n]).unwrap(), &[]).unwrap();
-        let ar: Vec<f32> =
-          if gpu.fast.gemm.is_some() { a.iter().map(half).collect() } else { a.clone() };
+        let fast = gpu.tile_rows(n, m).is_some();
+        let ar: Vec<f32> = if fast { a.iter().map(half).collect() } else { a.clone() };
         let want: Vec<f32> = (0..m * n)
           .map(|i| (0..k).map(|x| ar[i / n * 64 + x] * wf[i % n * k + x]).sum())
           .collect();
