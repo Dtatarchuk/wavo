@@ -148,12 +148,12 @@ fn run(args: &[&str]) -> Result<()> {
   const USAGE: &str =
     "usage: wavo run [MODEL] AUDIO [--model MODEL] [--json | --srt] [--segment SECS] [-y]";
   let (mut format, mut segment, mut download) = (None, None, Download::Ask);
-  let mut rest = Vec::new();
+  let (mut named, mut rest) = (None, Vec::new());
   let mut args = args.iter();
   while let Some(&arg) = args.next() {
     match arg {
       "--json" | "--srt" if format.is_none() => format = Some(arg),
-      "--model" => rest.insert(0, *args.next().context(USAGE)?),
+      "--model" if named.is_none() => named = Some(*args.next().context(USAGE)?),
       "--segment" if segment.is_none() => {
         let secs = args.next().and_then(|s| s.parse::<u32>().ok()).filter(|&s| s == 0 || s >= 5);
         let secs =
@@ -165,12 +165,13 @@ fn run(args: &[&str]) -> Result<()> {
       _ => rest.push(arg),
     }
   }
-  let (model, audio) = match *rest {
-    [arg] if hub::lookup(arg).is_ok() && !Path::new(arg).exists() => {
+  let (model, audio) = match (named, &rest[..]) {
+    (Some(model), [audio]) => (model, *audio),
+    (None, [arg]) if hub::lookup(arg).is_ok() && !Path::new(arg).exists() => {
       bail!("no audio file given: wavo run {arg} AUDIO")
     }
-    [audio] => (models::DEFAULT, audio),
-    [model, audio] => (model, audio),
+    (None, [audio]) => (models::DEFAULT, *audio),
+    (None, [model, audio]) => (*model, *audio),
     _ => bail!(USAGE),
   };
   // Before anything is asked or downloaded.

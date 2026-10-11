@@ -282,8 +282,10 @@ impl Model {
   /// The spoken language of 16 kHz mono PCM samples in [-1, 1], as a multilingual Whisper model
   /// detects it on the first 30 s: every language the model knows, most likely first.
   ///
-  /// The first is the language [`transcribe`](Self::transcribe) picks for the same samples. Only
-  /// the first 30 s are listened to, so passing more only takes longer. Short
+  /// The first is the language [`transcribe`](Self::transcribe) picks for the same samples. It
+  /// hears the first 30 s window only, but as in `transcribe` the features are scaled to the
+  /// loudest moment of all the samples, so later audio can shift the answer slightly; pass the
+  /// first 30 s to save time. Short
   /// clips (a few seconds) are the least reliable, small models more so. Empty for models
   /// without language identification: GigaAM, Parakeet and the English-only Whisper models
   /// (`.en`).
