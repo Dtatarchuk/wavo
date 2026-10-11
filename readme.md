@@ -5,7 +5,9 @@
 **Local speech-to-text at GPU speed**
 
 [<img src="https://badges.ws/crates/v/wavo" alt="version" />](https://crates.io/crates/wavo)
+[<img src="https://badges.ws/crates/docs/wavo" alt="docs" />](https://docs.rs/wavo)
 [<img src="https://badges.ws/github/license/vladkens/wavo" alt="license" />](https://github.com/vladkens/wavo/blob/main/LICENSE)
+[<img src="https://badges.ws/badge/follow-@uid127-black" alt="follow @uid127" />](https://x.com/uid127)
 
 </div>
 
@@ -210,6 +212,24 @@ transcribe.cpp for the CPU with Visual Studio's compiler; for its GPU build run 
 KhronosGroup.VulkanSDK` (in PowerShell) and add `-DTRANSCRIBE_VULKAN=ON` to the cmake configure
 step. `ssh user@host wsl` opens the default WSL distribution instead, a separate Linux with its own
 toolchain.
+
+For a headless machine, Remote Desktop (built into Windows Pro) works without a monitor. Allow it
+and SSH only from the local network (here 192.168.8.0/23; `LocalSubnet` would leave out a client
+in the neighbouring subnet). A Windows update can switch the network to Public, which blocks the
+default SSH rule, so allow both rules on every profile:
+
+```powershell
+Set-NetFirewallRule -DisplayGroup 'Remote Desktop' -Profile Any -RemoteAddress 192.168.8.0/23
+Set-NetFirewallRule -Name OpenSSH-Server-In-TCP -Profile Any -RemoteAddress 192.168.8.0/23
+Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+Set-NetConnectionProfile -InterfaceAlias '<adapter>' -NetworkCategory Private
+```
+
+On a Mac, connect with Windows App (App Store), signing in with the account's password, not its
+PIN. It needs Local Network access in System Settings, and an outbound firewall such as LuLu must
+allow it to reach the machine on TCP 3389. Error 0x4 is a generic connection failure: when
+`nc -z <host> 3389` works from the Terminal, the block is on the Mac.
 
 </details>
 
