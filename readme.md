@@ -213,8 +213,9 @@ files you fetch yourself, with a pure Rust build. Decoding and resampling audio 
 `model.max_audio_ms()` (15 s on the Neural Engine, 25 s for GigaAM, 30 s for Whisper and
 Moonshine) and joins the transcripts; `wavo::split` gives the pieces to transcribe yourself. On a
 Mac, `hub.pull` also prepares Parakeet and GigaAM for the Neural Engine, `wavo::Model::prepare`
-does it for a file you manage, and `Model::load` then runs them there;
-`Model::load_with(path, Backend::Gpu)` picks the GPU. The [API docs](https://docs.rs/wavo) have
+does it for a file you manage, and `Model::load` then runs them there. The system caches this
+per program, so your app prepares for itself even when `wavo pull` already did (then it takes
+one load of 10–30 s, without rebuilding); `Model::load_with(path, Backend::Gpu)` picks the GPU. The [API docs](https://docs.rs/wavo) have
 the details, including downloading on a thread with progress and cancel, as
 [examples/hub.rs](examples/hub.rs) does.
 

@@ -158,9 +158,12 @@
 //! on the GPU. The model needs preparing once, which writes its encoder as a Core ML program and
 //! has the system compile it (15–30 s, and as much disk as the GGUF):
 //! [`Hub::pull`][hub-pull] does it after the download, and [`Model::prepare`] does it for a file
-//! you manage. [`Model::load`] then runs it on the Neural Engine, falling back to the GPU while
-//! the file isn't prepared; [`Model::load_with`] picks a [`Backend`], and [`Model::backend`] tells
-//! which one runs.
+//! you manage. The system keeps its Neural Engine compile per program, so each program prepares
+//! for itself: in a program that prepared before, `prepare` only loads the model (under a
+//! second); in another one, such as yours after `wavo pull`, it reuses the compiled model and
+//! loads it once for 10–30 s. [`Model::load`] then runs the model on the Neural Engine, and on the
+//! GPU in a program that hasn't prepared it; [`Model::load_with`] picks a [`Backend`], and
+//! [`Model::backend`] tells which one runs.
 //!
 //! ```no_run
 //! # fn main() -> wavo::Result<()> {
@@ -236,7 +239,8 @@ enum Family {
 #[non_exhaustive]
 pub enum Backend {
   /// The faster one for the model's family on this machine: the Neural Engine for Parakeet and
-  /// GigaAM once [prepared](Model::prepare), else the GPU. [`Model::load`] uses it.
+  /// GigaAM once [prepared](Model::prepare) in this program, else the GPU. [`Model::load`] uses
+  /// it.
   #[default]
   Auto,
   /// The GPU through wgpu, on every platform: the same text, tokens and timestamps as
@@ -284,9 +288,8 @@ impl Model {
   ///
   /// The file is one of the Q8_0 GGUFs transcribe.cpp publishes (see the
   /// [model table](crate#models)); the family comes from its `general.architecture`. Parakeet and
-  /// GigaAM load on the Neural Engine when the file is [prepared](Model::prepare) on a Mac that
-  /// has one, and on the GPU otherwise. On the Neural Engine a load takes about 0.1 s, but 10–30 s
-  /// the first time in a program that didn't prepare the file itself.
+  /// GigaAM load on the Neural Engine (in about 0.1 s) when this program has
+  /// [prepared](Model::prepare) the file on a Mac that has one, and on the GPU otherwise.
   ///
   /// # Errors
   ///
@@ -331,10 +334,11 @@ impl Model {
     let ane = match backend {
       Backend::Gpu => None,
       Backend::NeuralEngine => Some(neural_engine(path, arch)?),
-      // A file that isn't prepared, or that Core ML fails to load, runs on the GPU.
-      Backend::Auto => {
-        (auto(arch) == Backend::NeuralEngine).then(|| neural_engine(path, arch).ok()).flatten()
-      }
+      // A file that isn't prepared in this program, or that Core ML fails to load, runs on the
+      // GPU: a first load in this program would compile for the Neural Engine for 10–30 s.
+      Backend::Auto => (auto(arch) == Backend::NeuralEngine && ane::prepared(path))
+        .then(|| neural_engine(path, arch).ok())
+        .flatten(),
     };
     let backend = if ane.is_some() { Backend::NeuralEngine } else { Backend::Gpu };
     let family = match arch {
@@ -438,10 +442,10 @@ impl Model {
   ///
   /// It blocks for 15–40 s the first time, mostly while the system compiles the program for the
   /// Neural Engine: run it on a thread of your own, as `Hub::pull` (the `hub` feature), which calls
-  /// it after each download, does. A prepared file returns after one load of under a second. The
-  /// system keeps that last compile per program, so prepare in the program that loads the model:
-  /// in another one (a helper that downloads, `wavo pull` for your app) the first load takes as
-  /// long again, and later loads are fast. The
+  /// it after each download, does. The system keeps that last compile per program, so prepare in
+  /// the program that loads the model: once it has prepared there, `prepare` returns after one
+  /// load of under a second; when another program prepared the file (`wavo pull`, a helper that
+  /// downloads), it skips the build and spends the 10–30 s on that load. The
   /// compiled model takes about as much disk as the GGUF, in `~/Library/Caches/wavo/`, named by
   /// a hash of the file's content: copies of the file share it. [`Model::unprepare`] deletes it,
   /// and `prepare` deletes compiled models no load has used for 30 days (of files deleted
@@ -482,9 +486,12 @@ impl Model {
     ane::prepare(path, &g, build, progress)
   }
 
-  /// Whether a model file is [prepared](Model::prepare) for the Neural Engine: `Some(true)` when
-  /// [`Model::load`] runs it there, `Some(false)` when `prepare` would make it so, `None` when
-  /// the family or this machine has no Neural Engine path (or the file can't be read).
+  /// Whether a model file is [prepared](Model::prepare) for the Neural Engine in this program:
+  /// `Some(true)` when [`Model::load`] runs it there, `Some(false)` when `prepare` would make it
+  /// so, `None` when the family or this machine has no Neural Engine path (or the file can't be
+  /// read). Another program's prepare doesn't count: the system caches the Neural Engine's
+  /// compile per program, so `prepare` in this one is fast (no rebuild) but loads once for
+  /// 10–30 s.
   pub fn prepared(path: impl AsRef<Path>) -> Option<bool> {
     let path = path.as_ref();
     let g = gguf::Gguf::open(path).ok()?;

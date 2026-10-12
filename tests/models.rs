@@ -101,18 +101,21 @@ fn check(name: &str, samples: &[&str]) {
   }
 }
 
-/// Neural Engine agreement: F16 activations and 8-bit weights move a few tokens by a frame or two.
-/// A clip that fits the 15 s window must give the fixture's text and pieces, with at least 95% of
-/// the tokens within two encoder frames of the fixture's start; a longer clip is split at pauses
-/// into pieces of the window, which changes punctuation at the cuts, so each piece is held to the
-/// GPU's transcript of the same piece by the same rule. Prepares the model first (15–40 s the
-/// first time), and fails on a Mac without a Neural Engine.
+/// Neural Engine agreement. F16 activations, 8-bit weights and arithmetic that differs between
+/// chip generations move a few tokens by a frame or two and now and then drop a comma, so per
+/// clip: the words equal the expected ones ignoring punctuation and case, with at most one word
+/// differing in punctuation or case (each printed); and of the tokens that aren't punctuation
+/// alone, the same pieces ignoring case, at least 95% starting within two encoder frames of the
+/// expected start. A clip that fits the 15 s window is held to the fixture. A longer one is split
+/// at pauses into pieces of the window, which changes punctuation at the cuts, so each piece is
+/// held to the GPU's transcript of the same piece. Prepares the model first (15–40 s the first
+/// time), and fails on a Mac without a Neural Engine.
 #[cfg(target_os = "macos")]
 fn check_ane(name: &str, frame_ms: u32, samples: &[&str]) {
-  type Tokens = Vec<(String, u32)>;
   use std::ops::ControlFlow;
 
   use wavo::{Backend, Model};
+  type Tokens = Vec<(String, u32)>;
 
   let _gpu = GPU.lock().unwrap_or_else(PoisonError::into_inner);
   let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -123,38 +126,52 @@ fn check_ane(name: &str, frame_ms: u32, samples: &[&str]) {
   assert_eq!(ane.backend(), Backend::NeuralEngine);
   let window = ane.max_audio_ms().unwrap();
   let mut gpu = None;
-  let pieces = |t: &wavo::Transcript| -> Tokens {
+  let tokens = |t: &wavo::Transcript| -> Tokens {
     t.tokens.iter().map(|t| (t.piece.replace('▁', " "), t.start_ms)).collect()
   };
+  let bare = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
   for sample in samples {
     let pcm = read_wav(&root.join(format!("3rd/transcribe.cpp/samples/{sample}.wav")));
-    let pairs: Vec<(String, Tokens, wavo::Transcript)> = if pcm.len() / 16 <= window as usize {
-      let (text, tokens, _) = read_fixture(name, sample);
-      vec![(text, tokens.unwrap(), ane.transcribe(&pcm).unwrap())]
+    let pieces: Vec<(String, Tokens, wavo::Transcript)> = if pcm.len() / 16 <= window as usize {
+      let (text, want, _) = read_fixture(name, sample);
+      vec![(text, want.unwrap(), ane.transcribe(&pcm).unwrap())]
     } else {
       let gpu = gpu.get_or_insert_with(|| Model::load_with(&path, Backend::Gpu).unwrap());
       (wavo::split(&pcm, window).into_iter())
         .map(|r| {
           let want = gpu.transcribe(&pcm[r.clone()]).unwrap();
-          (want.text.clone(), pieces(&want), ane.transcribe(&pcm[r]).unwrap())
+          (want.text.clone(), tokens(&want), ane.transcribe(&pcm[r]).unwrap())
         })
         .collect()
     };
-    for (i, (text, want, got)) in pairs.iter().enumerate() {
-      assert_eq!(&got.text, text, "{name} {sample} piece {i}: text");
-      let got = pieces(got);
-      let names = |v: &[(String, u32)]| v.iter().map(|t| t.0.clone()).collect::<Vec<_>>();
-      assert_eq!(names(&got), names(want), "{name} {sample} piece {i}: pieces");
-      let offsets: Vec<u32> = got.iter().zip(want).map(|(g, w)| g.1.abs_diff(w.1)).collect();
+    let mut changed = 0;
+    for (i, (text, want, got)) in pieces.iter().enumerate() {
+      let at = format!("{name} {sample} piece {i}");
+      let words = |t: &str| -> Vec<(String, String)> {
+        t.split_whitespace().map(|w| (bare(w), w.to_string())).filter(|w| !w.0.is_empty()).collect()
+      };
+      let (expected, actual) = (words(text), words(&got.text));
+      let bare_words = |v: &[(String, String)]| v.iter().map(|w| w.0.clone()).collect::<Vec<_>>();
+      assert_eq!(bare_words(&actual), bare_words(&expected), "{at}: words\n{}\n{text}", got.text);
+      for (a, e) in actual.iter().zip(&expected).filter(|(a, e)| a.1 != e.1) {
+        println!("{at}: {:?} instead of {:?}", a.1, e.1);
+        changed += 1;
+      }
+      // Tokens with letters or digits, compared by position.
+      let words_only = |v: &Tokens| -> Tokens {
+        v.iter().filter(|t| !bare(&t.0).is_empty()).map(|t| (t.0.to_lowercase(), t.1)).collect()
+      };
+      let (got, want) = (words_only(&tokens(got)), words_only(want));
+      let pieces = |v: &Tokens| v.iter().map(|t| t.0.clone()).collect::<Vec<_>>();
+      assert_eq!(pieces(&got), pieces(&want), "{at}: pieces");
+      let offsets: Vec<u32> = got.iter().zip(&want).map(|(g, w)| g.1.abs_diff(w.1)).collect();
       let close = offsets.iter().filter(|&&d| d <= 2 * frame_ms).count();
       let worst = offsets.iter().max().copied().unwrap_or(0);
       let moved = offsets.iter().filter(|&&d| d > 0).count();
-      println!(
-        "{name} {sample} piece {i}: {moved}/{} tokens moved, at most {worst} ms",
-        offsets.len()
-      );
-      assert!(close * 100 >= offsets.len() * 95, "{name} {sample} piece {i}: offsets {offsets:?}");
+      println!("{at}: {moved}/{} tokens moved, at most {worst} ms", offsets.len());
+      assert!(close * 100 >= offsets.len() * 95, "{at}: offsets {offsets:?}");
     }
+    assert!(changed <= 1, "{name} {sample}: {changed} words differ in punctuation or case");
   }
 }
 

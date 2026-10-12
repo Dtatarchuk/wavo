@@ -71,9 +71,21 @@ fn compiled(path: &Path) -> Result<PathBuf> {
   Ok(cache()?.join(format!("{}.v{GRAPH}.mlmodelc", hash(path)?)))
 }
 
-/// Whether the GGUF's compiled model is in the cache, on a Mac that can run it.
+/// The marker a load in this program touches next to a compiled model: the system caches its
+/// Neural Engine compile per program, and a first load elsewhere takes 10–30 s.
+fn loaded(compiled: &Path) -> PathBuf {
+  let exe = std::env::current_exe().ok();
+  let name = exe.as_deref().and_then(Path::file_stem).map(|s| s.to_string_lossy().into_owned());
+  let name: String = (name.unwrap_or_default().chars())
+    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+    .collect();
+  compiled.with_extension(format!("{name}.loaded"))
+}
+
+/// Whether the GGUF's compiled model is in the cache and this program has loaded it before, on a
+/// Mac that can run it: then a load takes about 0.1 s.
 pub fn prepared(path: &Path) -> bool {
-  coreml::available() && compiled(path).is_ok_and(|p| p.is_dir())
+  coreml::available() && compiled(path).is_ok_and(|p| p.is_dir() && loaded(&p).exists())
 }
 
 /// Loads the GGUF's compiled model.
@@ -89,8 +101,9 @@ pub fn load(path: &Path) -> Result<Model> {
       "the model is not prepared for the Neural Engine: run `wavo pull` or wavo::Model::prepare",
     ));
   }
-  touch(&compiled);
-  Model::load(&compiled)
+  let model = Model::load(&compiled)?;
+  let _ = File::create(loaded(&compiled));
+  Ok(model)
 }
 
 /// Builds and compiles the GGUF's program unless it is in the cache, then loads it once so the
@@ -129,8 +142,8 @@ pub fn prepare(
     built?;
   }
   step(PrepareStep::Load)?;
-  touch(&target);
   Model::load(&target)?;
+  let _ = File::create(loaded(&target));
   Ok(true)
 }
 
@@ -157,22 +170,22 @@ pub fn unprepare(path: &Path) -> Result<u64> {
   key(path)?.map_or(Ok(0), |key| remove(&key))
 }
 
-/// Marks a compiled model as used now, for `prune`.
-fn touch(compiled: &Path) {
-  let _ = File::create(compiled.with_extension("used"));
-}
-
-/// Deletes compiled models unused for 30 days: those of GGUFs deleted behind wavo's back (`hf
-/// cache rm`, another cache folder) and of older graph versions.
+/// Deletes compiled models no program has loaded for 30 days (by their newest `loaded` marker):
+/// those of GGUFs deleted behind wavo's back (`hf cache rm`, another cache folder) and of older
+/// graph versions.
 fn prune(dir: &Path) {
   const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
-  for path in fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()) {
-    let used = fs::metadata(path.with_extension("used")).or_else(|_| fs::metadata(&path));
-    let old = used.and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|a| a > MAX_AGE));
-    if path.extension().is_some_and(|e| e == "mlmodelc") && old {
-      let _ = fs::remove_dir_all(&path);
-      let _ = fs::remove_file(path.with_extension("used"));
-      let _ = fs::remove_file(path.with_extension("lock"));
+  let paths: Vec<PathBuf> =
+    fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
+  let name = |p: &Path| p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+  for compiled in paths.iter().filter(|p| p.extension().is_some_and(|e| e == "mlmodelc")) {
+    let stem = name(&compiled.with_extension(""));
+    let mine = || paths.iter().filter(|p| name(p).starts_with(&format!("{stem}.")));
+    let times =
+      mine().chain([compiled]).filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
+    if times.max().is_some_and(|t| t.elapsed().is_ok_and(|age| age > MAX_AGE)) {
+      let _ = fs::remove_dir_all(compiled);
+      mine().for_each(|p| _ = fs::remove_file(p));
     }
   }
 }
