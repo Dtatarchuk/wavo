@@ -38,6 +38,11 @@ pub fn available() -> bool {
   autoreleasepool(|_| unsafe { MLAllComputeDevices() }.iter().any(|d| d.isKindOfClass(class)))
 }
 
+/// The OS version with its build, such as `Version 15.8.1 (Build 24H32)`.
+pub fn os_version() -> String {
+  NSProcessInfo::processInfo().operatingSystemVersionString().to_string()
+}
+
 /// Compiles an `.mlpackage` and returns the compiled `.mlmodelc` folder, which Core ML leaves in
 /// a temporary folder.
 pub fn compile(package: &Path) -> Result<PathBuf> {

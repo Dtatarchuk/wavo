@@ -241,6 +241,11 @@ pub enum Backend {
   /// The faster one for the model's family on this machine: the Neural Engine for Parakeet and
   /// GigaAM once [prepared](Model::prepare) in this program, else the GPU. [`Model::load`] uses
   /// it.
+  ///
+  /// The system caches the Neural Engine's compile of a model per program, and a load without
+  /// that cache takes 10–30 s. A new build of the program or of macOS counts as a new program
+  /// (it runs on the GPU until it prepares), but when the system drops its cache on its own, for
+  /// example to free disk space, the next load takes that long once.
   #[default]
   Auto,
   /// The GPU through wgpu, on every platform: the same text, tokens and timestamps as

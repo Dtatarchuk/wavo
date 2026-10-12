@@ -16,7 +16,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 pub use conformer::Graph;
 pub use coreml::{Model, available};
@@ -50,20 +50,24 @@ fn hash(path: &Path) -> Result<String> {
   const PART: u64 = 1 << 20;
   let mut f = File::open(path)?;
   let len = f.metadata()?.len();
-  let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-  let mut eat = |bytes: &[u8]| {
-    for &b in bytes {
-      h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
-    }
-  };
-  eat(&len.to_le_bytes());
+  let mut h = FNV;
+  fnv(&mut h, &len.to_le_bytes());
   let mut buf = vec![0; PART.min(len) as usize];
   f.read_exact(&mut buf)?;
-  eat(&buf);
+  fnv(&mut h, &buf);
   f.seek(SeekFrom::Start(len - buf.len() as u64))?;
   f.read_exact(&mut buf)?;
-  eat(&buf);
+  fnv(&mut h, &buf);
   Ok(format!("{h:016x}"))
+}
+
+/// FNV-1a's 64-bit offset basis, and the hash of `h` extended by `bytes`.
+const FNV: u64 = 0xcbf2_9ce4_8422_2325;
+
+fn fnv(h: &mut u64, bytes: &[u8]) {
+  for &b in bytes {
+    *h = (*h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+  }
 }
 
 /// The compiled model of a GGUF file, whether it exists or not.
@@ -71,21 +75,44 @@ fn compiled(path: &Path) -> Result<PathBuf> {
   Ok(cache()?.join(format!("{}.v{GRAPH}.mlmodelc", hash(path)?)))
 }
 
-/// The marker a load in this program touches next to a compiled model: the system caches its
-/// Neural Engine compile per program, and a first load elsewhere takes 10–30 s.
-fn loaded(compiled: &Path) -> PathBuf {
+/// The marker a load in this program touches next to a compiled model,
+/// `<compiled stem>.<program>.<stamp>.loaded`. The system caches its Neural Engine compile per
+/// executable (by content) and drops it on OS updates, and a load without that cache takes
+/// 10–30 s, so the stamp hashes the executable's size and time and the OS version: a rebuilt or
+/// updated program or OS finds no marker.
+fn loaded(compiled: &Path) -> (PathBuf, String) {
   let exe = std::env::current_exe().ok();
   let name = exe.as_deref().and_then(Path::file_stem).map(|s| s.to_string_lossy().into_owned());
   let name: String = (name.unwrap_or_default().chars())
     .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
     .collect();
-  compiled.with_extension(format!("{name}.loaded"))
+  let meta = exe.and_then(|p| fs::metadata(p).ok());
+  let time =
+    meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(UNIX_EPOCH).ok());
+  let stamp = format!("{:?} {time:?} {}", meta.map(|m| m.len()), coreml::os_version());
+  let mut h = FNV;
+  fnv(&mut h, stamp.as_bytes());
+  let prefix = format!("{}.{name}.", compiled.with_extension("").display());
+  (PathBuf::from(format!("{prefix}{:08x}.loaded", h as u32)), prefix)
+}
+
+/// Touches this program's marker and deletes its markers of older stamps.
+fn mark(compiled: &Path) {
+  let (marker, prefix) = loaded(compiled);
+  let _ = File::create(&marker);
+  for old in
+    fs::read_dir(compiled.parent().unwrap()).into_iter().flatten().flatten().map(|e| e.path())
+  {
+    if old != marker && old.to_string_lossy().starts_with(&prefix) {
+      let _ = fs::remove_file(old);
+    }
+  }
 }
 
 /// Whether the GGUF's compiled model is in the cache and this program has loaded it before, on a
 /// Mac that can run it: then a load takes about 0.1 s.
 pub fn prepared(path: &Path) -> bool {
-  coreml::available() && compiled(path).is_ok_and(|p| p.is_dir() && loaded(&p).exists())
+  coreml::available() && compiled(path).is_ok_and(|p| p.is_dir() && loaded(&p).0.exists())
 }
 
 /// Loads the GGUF's compiled model.
@@ -102,7 +129,7 @@ pub fn load(path: &Path) -> Result<Model> {
     ));
   }
   let model = Model::load(&compiled)?;
-  let _ = File::create(loaded(&compiled));
+  mark(&compiled);
   Ok(model)
 }
 
@@ -143,7 +170,7 @@ pub fn prepare(
   }
   step(PrepareStep::Load)?;
   Model::load(&target)?;
-  let _ = File::create(loaded(&target));
+  mark(&target);
   Ok(true)
 }
 

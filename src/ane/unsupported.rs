@@ -9,6 +9,10 @@ pub fn available() -> bool {
   false
 }
 
+pub fn os_version() -> String {
+  String::new()
+}
+
 pub fn compile(_: &Path) -> Result<PathBuf> {
   Err(Error::NeuralEngine("Core ML is only on macOS".into()))
 }
