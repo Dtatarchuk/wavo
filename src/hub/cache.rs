@@ -48,7 +48,7 @@ impl Hub {
         let xdg = var("XDG_CACHE_HOME").map(PathBuf::from).unwrap_or_else(|| user().join(".cache"));
         (xdg.join("huggingface").join("hub"), None)
       });
-    Self { root, from }
+    Self { root, from, prepare: true }
   }
 
   fn folder(&self, repo: &str) -> PathBuf {
@@ -432,7 +432,7 @@ mod tests {
       vars.push((var, value));
       assert_eq!(root(&vars), (PathBuf::from(expected), from), "{var}");
     }
-    let hub = Hub { root: PathBuf::from("/c"), from: Some("HF_HUB_CACHE") };
+    let hub = Hub { root: PathBuf::from("/c"), from: Some("HF_HUB_CACHE"), prepare: true };
     assert_eq!(hub.to_string(), "/c (set by HF_HUB_CACHE)");
     assert_eq!(Hub::at("/c").to_string(), "/c");
   }

@@ -178,6 +178,8 @@ pub struct Hub {
   root: PathBuf,
   /// The environment variable that set `root`, if any.
   from: Option<&'static str>,
+  /// Whether `pull` prepares models for the Neural Engine.
+  prepare: bool,
 }
 
 impl Default for Hub {
@@ -198,7 +200,28 @@ impl Hub {
   /// A cache in a folder of your own, such as your app's data folder. It is created on the first
   /// pull.
   pub fn at(root: impl Into<PathBuf>) -> Self {
-    Self { root: root.into(), from: None }
+    Self { root: root.into(), from: None, prepare: true }
+  }
+
+  /// Whether [`pull`](Self::pull) also [prepares](crate::Model::prepare) Parakeet and GigaAM for
+  /// the Neural Engine after the download (the default) or only downloads. Preparing compiles in
+  /// the calling process, with a peak of about the model's size and Core ML state that stays,
+  /// and warms the Neural Engine for this program only: an app that loads models in another
+  /// process (a helper, the same executable started again) downloads with `prepare(false)` and
+  /// calls `Model::prepare` there.
+  ///
+  /// ```no_run
+  /// use std::ops::ControlFlow;
+  ///
+  /// let hub = wavo::hub::Hub::new().prepare(false);
+  /// let path = hub.pull("parakeet-v3", |_| ControlFlow::Continue(()))?;
+  /// // Later, in the process that transcribes:
+  /// wavo::Model::prepare(&path, |_| ControlFlow::Continue(()))?;
+  /// # Ok::<(), wavo::Error>(())
+  /// ```
+  pub fn prepare(mut self, prepare: bool) -> Self {
+    self.prepare = prepare;
+    self
   }
 
   /// The cache folder.
@@ -225,12 +248,14 @@ impl Hub {
   ///
   /// Then, for Parakeet and GigaAM on a Mac with a Neural Engine, it
   /// [prepares](crate::Model::prepare) the file for it: 15–40 s the first time, under a second
-  /// once prepared. Elsewhere, and for the other families, this step is skipped.
+  /// once prepared. Elsewhere, for the other families and with [`prepare(false)`](Self::prepare),
+  /// this step is skipped.
   ///
   /// `progress` is called when the download starts, after every chunk it receives (often: throttle
   /// your own UI updates), before every retry, and as each step of preparing starts
   /// ([`Progress::preparing`]). Return [`ControlFlow::Break`] to cancel: a partial file stays for
-  /// the next pull to resume.
+  /// the next pull to resume. While preparing, `Break` cancels before the next step starts; a
+  /// step that has started (the system's compile in `Load` takes the longest) runs to its end.
   ///
   /// # Errors
   ///
@@ -267,6 +292,9 @@ impl Hub {
   ) -> Result<PathBuf> {
     let m = lookup(name)?;
     let path = self.pull_file(&m.repo(), &m.file(), &mut progress)?;
+    if !self.prepare {
+      return Ok(path);
+    }
     // Under the repository lock, as `remove` takes it: the file stays while it is read.
     let _repo = self.lock(&m.repo(), "wavo")?;
     let size = std::fs::metadata(&path)?.len();
