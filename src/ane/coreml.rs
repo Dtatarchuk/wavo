@@ -10,9 +10,8 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, ClassType};
 use objc2_core_ml::{
-  MLAllComputeDevices, MLComputeUnits, MLDictionaryFeatureProvider, MLFeatureProvider,
-  MLFeatureValue, MLModel, MLModelConfiguration, MLMultiArray, MLMultiArrayDataType,
-  MLNeuralEngineComputeDevice,
+  MLComputeUnits, MLDictionaryFeatureProvider, MLFeatureProvider, MLFeatureValue, MLModel,
+  MLModelConfiguration, MLMultiArray, MLMultiArrayDataType, MLNeuralEngineComputeDevice,
 };
 use objc2_foundation::{
   NSArray, NSDictionary, NSError, NSNumber, NSObjectProtocol, NSProcessInfo, NSString, NSURL,
@@ -35,7 +34,9 @@ pub fn available() -> bool {
     return false;
   }
   let class = MLNeuralEngineComputeDevice::class();
-  autoreleasepool(|_| unsafe { MLAllComputeDevices() }.iter().any(|d| d.isKindOfClass(class)))
+  // A class method, so a binary built for older macOS still starts there (no link-time symbol).
+  let devices = autoreleasepool(|_| unsafe { MLModel::availableComputeDevices() });
+  devices.iter().any(|d| d.isKindOfClass(class))
 }
 
 /// The OS version with its build, such as `Version 15.8.1 (Build 24H32)`.

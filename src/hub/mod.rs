@@ -267,6 +267,8 @@ impl Hub {
   ) -> Result<PathBuf> {
     let m = lookup(name)?;
     let path = self.pull_file(&m.repo(), &m.file(), &mut progress)?;
+    // Under the repository lock, as `remove` takes it: the file stays while it is read.
+    let _repo = self.lock(&m.repo(), "wavo")?;
     let size = std::fs::metadata(&path)?.len();
     crate::Model::prepare(&path, |step| {
       progress(Progress { done: size, total: size, retrying: None, preparing: Some(step) })
@@ -290,7 +292,7 @@ impl Hub {
   /// - [`Error::Io`]: deleting failed.
   pub fn remove(&self, name: &str) -> Result<Option<u64>> {
     let m = lookup(name)?;
-    // Named by the file's content, which is gone once removed.
+    // Named by the file, which is gone once removed.
     let prepared = self.find(name).map(|path| crate::ane::key(&path)).transpose()?.flatten();
     let freed = self.remove_file(&m.repo(), &m.file())?;
     let ane = prepared.map(|key| crate::ane::remove(&key)).transpose()?.unwrap_or(0);

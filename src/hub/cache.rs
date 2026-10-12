@@ -98,7 +98,7 @@ impl Hub {
   }
 
   /// Holds `<root>/.locks/<repo folder>/<name>.lock` until the file is dropped.
-  fn lock(&self, repo: &str, name: &str) -> Result<File> {
+  pub(super) fn lock(&self, repo: &str, name: &str) -> Result<File> {
     let dir = self.root.join(".locks").join(self.folder(repo).file_name().unwrap());
     fs::create_dir_all(&dir)?;
     hold(&dir.join(format!("{name}.lock")))

@@ -37,7 +37,8 @@ Run options:
   --srt                        print subtitles
   --segment SECS               split longer audio at pauses into parts of up to SECS
                                (15 on the Neural Engine, 25 for GigaAM, 30 for Whisper
-                               and Moonshine, else 60; 0 for one pass)
+                               and Moonshine, else 60; 0 for one pass; at most 15
+                               on the Neural Engine)
   -y, --yes                    download a missing model without asking
   --backend auto|gpu|ane       where the encoder runs: auto (the default) takes the Neural
                                Engine for Parakeet and GigaAM once `wavo pull` prepared
@@ -193,7 +194,12 @@ fn run(args: &[&str]) -> Result<()> {
   let pcm = audio::read(audio)?;
   bar.set_message("loading the model");
   let model = load(&path, on)?;
-  let max_ms = segment.or(model.max_audio_ms()).unwrap_or(SEGMENT_MS);
+  let mut max_ms = segment.or(model.max_audio_ms()).unwrap_or(SEGMENT_MS);
+  if model.backend() == Backend::NeuralEngine {
+    // Its window caps the pieces, so subtitles see every cut.
+    let window = model.max_audio_ms().unwrap_or(u32::MAX);
+    max_ms = if max_ms == 0 { window } else { max_ms.min(window) };
+  }
   let ranges = wavo::split(&pcm, if max_ms == 0 { u32::MAX } else { max_ms });
   let n = ranges.len();
   let parts = ranges.into_iter().enumerate().map(|(i, r)| {

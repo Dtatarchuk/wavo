@@ -4,7 +4,8 @@
 //! frontend and the decoder stay on the CPU.
 //!
 //! Compiled models live in `~/Library/Caches/wavo/`, outside the Hugging Face cache, named by a
-//! hash of the GGUF's content and the graph version: `<hash>.v<GRAPH>.mlmodelc`.
+//! hash of the GGUF file (size, modification time, first and last MiB) and the graph version:
+//! `<hash>.v<GRAPH>.mlmodelc`.
 
 pub mod conformer;
 #[cfg_attr(not(target_os = "macos"), path = "unsupported.rs")]
@@ -44,14 +45,17 @@ fn cache() -> Result<PathBuf> {
   Ok(PathBuf::from(home).join("Library/Caches/wavo"))
 }
 
-/// FNV-1a over the file's size and its first and last MiB: the header names every tensor with
-/// its offset, and the tail holds weights, so another file of the same name or size differs.
+/// FNV-1a over the file's size, modification time and first and last MiB: the header names every
+/// tensor with its offset, the tail holds weights, and a file rewritten in place has a new time.
 fn hash(path: &Path) -> Result<String> {
   const PART: u64 = 1 << 20;
   let mut f = File::open(path)?;
-  let len = f.metadata()?.len();
+  let meta = f.metadata()?;
+  let len = meta.len();
+  let time = meta.modified()?.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
   let mut h = FNV;
   fnv(&mut h, &len.to_le_bytes());
+  fnv(&mut h, &time.to_le_bytes());
   let mut buf = vec![0; PART.min(len) as usize];
   f.read_exact(&mut buf)?;
   fnv(&mut h, &buf);
@@ -182,12 +186,21 @@ pub fn key(path: &Path) -> Result<Option<String>> {
 /// Deletes the compiled models of every graph version named by `key`; returns the bytes freed.
 pub fn remove(key: &str) -> Result<u64> {
   let Ok(dir) = cache() else { return Ok(0) };
+  let paths: Vec<PathBuf> = (fs::read_dir(&dir).into_iter().flatten().flatten())
+    .map(|e| e.path())
+    .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&format!("{key}."))))
+    .filter(|p| p.extension().is_none_or(|e| e != "lock"))
+    .collect();
+  if paths.is_empty() {
+    return Ok(0);
+  }
+  // `prepare`'s lock, which stays in place: a new file would let another prepare in meanwhile.
+  let lock = File::create(dir.join(format!("{key}.v{GRAPH}.lock")))?;
+  lock.lock()?;
   let mut freed = 0;
-  for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
-    if e.file_name().to_string_lossy().starts_with(&format!("{key}.")) {
-      freed += size(&e.path());
-      if e.path().is_dir() { fs::remove_dir_all(e.path())? } else { fs::remove_file(e.path())? }
-    }
+  for p in paths {
+    freed += size(&p);
+    if p.is_dir() { fs::remove_dir_all(&p)? } else { fs::remove_file(&p)? }
   }
   Ok(freed)
 }
@@ -208,11 +221,20 @@ fn prune(dir: &Path) {
   for compiled in paths.iter().filter(|p| p.extension().is_some_and(|e| e == "mlmodelc")) {
     let stem = name(&compiled.with_extension(""));
     let mine = || paths.iter().filter(|p| name(p).starts_with(&format!("{stem}.")));
-    let times =
-      mine().chain([compiled]).filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
-    if times.max().is_some_and(|t| t.elapsed().is_ok_and(|age| age > MAX_AGE)) {
+    let times = mine().chain([compiled]).filter(|p| p.extension().is_none_or(|e| e != "lock"));
+    let times = times.filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
+    // Skipped while a prepare of the same model holds its lock; lock files stay.
+    let lock = fs::OpenOptions::new()
+      .create(true)
+      .truncate(false)
+      .write(true)
+      .open(compiled.with_extension("lock"));
+    let free = lock.as_ref().is_ok_and(|l| l.try_lock().is_ok());
+    if free && times.max().is_some_and(|t| t.elapsed().is_ok_and(|age| age > MAX_AGE)) {
       let _ = fs::remove_dir_all(compiled);
-      mine().for_each(|p| _ = fs::remove_file(p));
+      mine()
+        .filter(|p| p.extension().is_none_or(|e| e != "lock"))
+        .for_each(|p| _ = fs::remove_file(p));
     }
   }
 }

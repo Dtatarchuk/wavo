@@ -452,7 +452,8 @@ impl Model {
   /// load of under a second; when another program prepared the file (`wavo pull`, a helper that
   /// downloads), it skips the build and spends the 10–30 s on that load. The
   /// compiled model takes about as much disk as the GGUF, in `~/Library/Caches/wavo/`, named by
-  /// a hash of the file's content: copies of the file share it. [`Model::unprepare`] deletes it,
+  /// a hash of the file (size, modification time and some content), so the same file found
+  /// through another path or cache folder shares it. [`Model::unprepare`] deletes it,
   /// and `prepare` deletes compiled models no load has used for 30 days (of files deleted
   /// elsewhere). `progress` is called as each step starts; return [`ControlFlow::Break`] to
   /// cancel before the next.
