@@ -1,5 +1,6 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
-//! The protobuf wire format, encode only: what Core ML's `Model.proto` and `MIL.proto` need.
+//! The protobuf wire format, encode only: what Core ML's `Model.proto` and `MIL.proto` need
+//! (from coremltools, see `mil.rs`).
 
 /// A message being written. Nested messages are written into their own `Msg` and then appended
 /// with their length.

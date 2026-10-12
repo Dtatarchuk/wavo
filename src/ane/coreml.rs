@@ -30,18 +30,20 @@ fn url(path: &Path) -> Retained<NSURL> {
 /// Whether this Mac has a Neural Engine Core ML can use, on macOS 15 or later (the opset the
 /// programs use). Virtual machines have none.
 pub fn available() -> bool {
-  if NSProcessInfo::processInfo().operatingSystemVersion().majorVersion < 15 {
-    return false;
-  }
-  let class = MLNeuralEngineComputeDevice::class();
-  // A class method, so a binary built for older macOS still starts there (no link-time symbol).
-  let devices = autoreleasepool(|_| unsafe { MLModel::availableComputeDevices() });
-  devices.iter().any(|d| d.isKindOfClass(class))
+  autoreleasepool(|_| {
+    if NSProcessInfo::processInfo().operatingSystemVersion().majorVersion < 15 {
+      return false;
+    }
+    let class = MLNeuralEngineComputeDevice::class();
+    // A class method, so a binary built for older macOS still starts there (no link-time symbol).
+    let devices = unsafe { MLModel::availableComputeDevices() };
+    devices.iter().any(|d| d.isKindOfClass(class))
+  })
 }
 
 /// The OS version with its build, such as `Version 15.8.1 (Build 24H32)`.
 pub fn os_version() -> String {
-  NSProcessInfo::processInfo().operatingSystemVersionString().to_string()
+  autoreleasepool(|_| NSProcessInfo::processInfo().operatingSystemVersionString().to_string())
 }
 
 /// Compiles an `.mlpackage` and returns the compiled `.mlmodelc` folder, which Core ML leaves in
