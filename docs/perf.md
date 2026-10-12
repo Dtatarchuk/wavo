@@ -664,22 +664,13 @@ Numbers are in the plans' "## Result" sections.
 
 ### Neural Engine
 
-Warm ms of `wavo bench` (11 calls), jfk 11 s / dots 35.3 s (3 pieces on the ANE) / ru 4.5 s,
-order GPU, ANE, ref, ref, ANE, GPU; [plan](plans/completed/20261011-ane.md).
+Speed, load and prepare times are in the [plan's Result](plans/completed/20261011-ane.md#result).
 
-- 2026-10-12, M1 (macOS 15.8, quiet): Parakeet V3 ANE 69.7 / 250 / 53.0, GPU 252 / 643 / 115,
-  transcribe.cpp 295 / 968 / 142; GigaAM v3 ANE 52.2 / 178 / 42.0, GPU 170 / 430 / 70.5,
-  transcribe.cpp 180 / 523 / 74. Load on the ANE 100–145 ms, first call 54–82 ms (jfk, ru).
-  Process peak footprint ANE 21 / 16 MiB against GPU 780 / 315 MiB (Parakeet / GigaAM): the
-  weights live in the system's ANE service.
-- 2026-10-12, M2 (macOS 27, load average 15–35 from other jobs): Parakeet V3 ANE 56.7 / 206 /
-  77, GPU 150 / 440 / 104, transcribe.cpp 221 / 816; GigaAM v3 ANE 54.4 / 165–200 / 44.1, GPU
-  99 / 316 / 51, transcribe.cpp 112 / 395–422 / 56.
-- 2026-10-12, first prepare (fresh program name, so no system cache): M2 Parakeet V3 14.4 s
-  (build 1.9, compile 0.3, ANE load 12.2), GigaAM 11.7 s (0.6 / 0.1 / 11.0); M1 26.2 / 22.6 s.
-  The system caches the ANE compile per program: a load in another program than the one that
-  prepared takes as long once (M2 10.5–11.8 s, M1 21.5–24.8 s), then 0.06–0.15 s. Compiled
-  sizes 680 MB (Parakeet) and 254 MB (GigaAM).
+- 2026-10-12, the system caches the ANE compile per executable, by content: a copy under a new
+  name or a rebuild pays the 10–25 s again, a `touch` or a move doesn't. Kept: `Auto` takes the
+  ANE only after a load by the same program build on the same OS (a marker per program next to
+  the compiled model), so `load` never stalls; `prepare` in a new program skips the build and
+  only loads.
 - 2026-10-12, Parakeet V3 accuracy against the GPU on the same 15 s pieces of 7 clips (637
   tokens): per-row int8 on the ANE 11 tokens moved, at most 560 ms (ru-long's final "." in a
   trailing pause), one word differs (uk-long); F16 weights on the M1's ANE (one 1.1 GB program
