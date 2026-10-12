@@ -1,7 +1,8 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
 //! Transcripts must match the reference fixtures (`make fixtures`) exactly: text, every token piece
 //! and its start time (for Whisper every segment's text and start). Missing models or samples fail
-//! the test.
+//! the test. On macOS the Neural Engine runs the Parakeet and GigaAM models too, in agreement with
+//! the fixtures rather than exactly (`check_ane`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -70,7 +71,7 @@ fn read_fixture(name: &str, sample: &str) -> (String, Option<Vec<(String, u32)>>
 fn check(name: &str, samples: &[&str]) {
   let _gpu = GPU.lock().unwrap_or_else(PoisonError::into_inner);
   let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-  let model = wavo::Model::load(model_path(name)).unwrap();
+  let model = wavo::Model::load_with(model_path(name), wavo::Backend::Gpu).unwrap();
   for sample in samples {
     let pcm = read_wav(&root.join(format!("3rd/transcribe.cpp/samples/{sample}.wav")));
     let (text, tokens, segments) = read_fixture(name, sample);
@@ -97,6 +98,63 @@ fn check(name: &str, samples: &[&str]) {
       got = joined.into_iter().map(|(text, start)| (trim(text), start)).collect();
     }
     assert_eq!(got, tokens, "{name} {sample}: tokens");
+  }
+}
+
+/// Neural Engine agreement: F16 activations and 8-bit weights move a few tokens by a frame or two.
+/// A clip that fits the 15 s window must give the fixture's text and pieces, with at least 95% of
+/// the tokens within two encoder frames of the fixture's start; a longer clip is split at pauses
+/// into pieces of the window, which changes punctuation at the cuts, so each piece is held to the
+/// GPU's transcript of the same piece by the same rule. Prepares the model first (15–40 s the
+/// first time), and fails on a Mac without a Neural Engine.
+#[cfg(target_os = "macos")]
+fn check_ane(name: &str, frame_ms: u32, samples: &[&str]) {
+  type Tokens = Vec<(String, u32)>;
+  use std::ops::ControlFlow;
+
+  use wavo::{Backend, Model};
+
+  let _gpu = GPU.lock().unwrap_or_else(PoisonError::into_inner);
+  let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let path = model_path(name);
+  let prepared = Model::prepare(&path, |_| ControlFlow::Continue(())).unwrap();
+  assert!(prepared, "{name}: this Mac has no Neural Engine");
+  let ane = Model::load_with(&path, Backend::NeuralEngine).unwrap();
+  assert_eq!(ane.backend(), Backend::NeuralEngine);
+  let window = ane.max_audio_ms().unwrap();
+  let mut gpu = None;
+  let pieces = |t: &wavo::Transcript| -> Tokens {
+    t.tokens.iter().map(|t| (t.piece.replace('▁', " "), t.start_ms)).collect()
+  };
+  for sample in samples {
+    let pcm = read_wav(&root.join(format!("3rd/transcribe.cpp/samples/{sample}.wav")));
+    let pairs: Vec<(String, Tokens, wavo::Transcript)> = if pcm.len() / 16 <= window as usize {
+      let (text, tokens, _) = read_fixture(name, sample);
+      vec![(text, tokens.unwrap(), ane.transcribe(&pcm).unwrap())]
+    } else {
+      let gpu = gpu.get_or_insert_with(|| Model::load_with(&path, Backend::Gpu).unwrap());
+      (wavo::split(&pcm, window).into_iter())
+        .map(|r| {
+          let want = gpu.transcribe(&pcm[r.clone()]).unwrap();
+          (want.text.clone(), pieces(&want), ane.transcribe(&pcm[r]).unwrap())
+        })
+        .collect()
+    };
+    for (i, (text, want, got)) in pairs.iter().enumerate() {
+      assert_eq!(&got.text, text, "{name} {sample} piece {i}: text");
+      let got = pieces(got);
+      let names = |v: &[(String, u32)]| v.iter().map(|t| t.0.clone()).collect::<Vec<_>>();
+      assert_eq!(names(&got), names(want), "{name} {sample} piece {i}: pieces");
+      let offsets: Vec<u32> = got.iter().zip(want).map(|(g, w)| g.1.abs_diff(w.1)).collect();
+      let close = offsets.iter().filter(|&&d| d <= 2 * frame_ms).count();
+      let worst = offsets.iter().max().copied().unwrap_or(0);
+      let moved = offsets.iter().filter(|&&d| d > 0).count();
+      println!(
+        "{name} {sample} piece {i}: {moved}/{} tokens moved, at most {worst} ms",
+        offsets.len()
+      );
+      assert!(close * 100 >= offsets.len() * 95, "{name} {sample} piece {i}: offsets {offsets:?}");
+    }
   }
 }
 
@@ -130,6 +188,18 @@ fn parakeet_tdt_v2() {
 #[test]
 fn parakeet_tdt_v3() {
   check("parakeet-tdt-0.6b-v3", &["jfk", "ru-short", "uk-short"]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn parakeet_tdt_v2_ane() {
+  check_ane("parakeet-tdt-0.6b-v2", 80, &["jfk", "dots", "jobs-silence"]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn parakeet_tdt_v3_ane() {
+  check_ane("parakeet-tdt-0.6b-v3", 80, &["jfk", "ru-short", "uk-short"]);
 }
 
 #[test]

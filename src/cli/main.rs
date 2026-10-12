@@ -177,7 +177,7 @@ fn run(args: &[&str]) -> Result<()> {
   bar.set_message("loading the model");
   let model = load(&path)?;
   let max_ms = segment.or(model.max_audio_ms()).unwrap_or(SEGMENT_MS);
-  let ranges = split::segments(&pcm, if max_ms == 0 { usize::MAX } else { max_ms as usize * 16 });
+  let ranges = wavo::split(&pcm, if max_ms == 0 { u32::MAX } else { max_ms });
   let n = ranges.len();
   let parts = ranges.into_iter().enumerate().map(|(i, r)| {
     bar.set_message(format!("transcribing {}/{n}", i + 1));
