@@ -151,8 +151,9 @@ Hugging Face cache (`~/.cache/huggingface/hub`), so a model fetched with `hf dow
 On an Apple Silicon Mac with macOS 15 or later, `wavo pull` also prepares Parakeet and GigaAM for
 the Neural Engine: it compiles the model's encoder for Core ML once, which takes 15–30 s and as much
 disk as the model, in `~/Library/Caches/wavo`. From then on `wavo run` uses the Neural Engine for
-them (`wavo list` shows which are ready) and splits audio into pieces of up to 15 s; the text is
-the same as on the GPU, and some tokens start a frame or two apart. `--backend gpu` runs on the
+them (`wavo list` shows which are ready) and splits audio into pieces of up to 15 s; the words
+are the same as on the GPU on the test clips, while now and then a comma or a capital letter
+differs and some tokens start a frame or two apart. `--backend gpu` runs on the
 GPU anyway, `--backend ane` fails rather than fall back. Whisper and Moonshine always run on the
 GPU, where they are faster.
 

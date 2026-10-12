@@ -181,8 +181,9 @@
 //! ```
 //!
 //! The Neural Engine runs a fixed 15 s window in F16 with 8-bit weights: shorter audio is padded,
-//! longer audio split at pauses, and the text matches the GPU's on the test clips, while a few
-//! tokens start one or two encoder frames apart. The GPU stays the exact path.
+//! longer audio split at pauses. On the test clips the words match the GPU's, while now and then a
+//! comma or a capital letter differs and a few tokens start one or two encoder frames apart. The
+//! GPU stays the exact path.
 //!
 //! # Left to the caller
 //!
@@ -253,8 +254,8 @@ pub enum Backend {
   Gpu,
   /// Apple's Neural Engine through Core ML, on Apple Silicon with macOS 15 or later, for Parakeet
   /// and GigaAM once [prepared](Model::prepare). It runs in F16 with 8-bit weights in a fixed
-  /// 15 s window: the text matches the GPU's on the test clips, and some tokens start one
-  /// encoder frame apart.
+  /// 15 s window: on the test clips the words match the GPU's, while now and then a comma or a
+  /// capital letter differs and some tokens start one or two encoder frames apart.
   NeuralEngine,
 }
 

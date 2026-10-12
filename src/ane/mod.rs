@@ -101,9 +101,9 @@ fn loaded(compiled: &Path) -> (PathBuf, String) {
 }
 
 /// Touches this program's marker and deletes its markers of older stamps.
-fn mark(compiled: &Path) {
+fn mark(compiled: &Path) -> Result<()> {
   let (marker, prefix) = loaded(compiled);
-  let _ = File::create(&marker);
+  File::create(&marker)?;
   for old in
     fs::read_dir(compiled.parent().unwrap()).into_iter().flatten().flatten().map(|e| e.path())
   {
@@ -111,6 +111,7 @@ fn mark(compiled: &Path) {
       let _ = fs::remove_file(old);
     }
   }
+  Ok(())
 }
 
 /// Whether the GGUF's compiled model is in the cache and this program has loaded it before, on a
@@ -133,7 +134,7 @@ pub fn load(path: &Path) -> Result<Model> {
     ));
   }
   let model = Model::load(&compiled)?;
-  mark(&compiled);
+  let _ = mark(&compiled); // a load without its marker still works
   Ok(model)
 }
 
@@ -174,7 +175,7 @@ pub fn prepare(
   }
   step(PrepareStep::Load)?;
   Model::load(&target)?;
-  mark(&target);
+  mark(&target)?;
   Ok(true)
 }
 
@@ -185,8 +186,12 @@ pub fn key(path: &Path) -> Result<Option<String>> {
 
 /// Deletes the compiled models of every graph version named by `key`; returns the bytes freed.
 pub fn remove(key: &str) -> Result<u64> {
-  let Ok(dir) = cache() else { return Ok(0) };
-  let paths: Vec<PathBuf> = (fs::read_dir(&dir).into_iter().flatten().flatten())
+  let dir = cache()?;
+  let entries = match fs::read_dir(&dir) {
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+    entries => entries?,
+  };
+  let paths: Vec<PathBuf> = (entries.collect::<std::io::Result<Vec<_>>>()?.into_iter())
     .map(|e| e.path())
     .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&format!("{key}."))))
     .filter(|p| p.extension().is_none_or(|e| e != "lock"))
