@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use indicatif::{MultiProgress, ProgressBar, ProgressFinish, ProgressStyle};
 use models::Source;
-use wavo::PrepareStep;
 use wavo::hub::{self, Hub, MODELS};
+use wavo::{Backend, PrepareStep};
 
 const USAGE: &str = "\
 Usage: wavo COMMAND ...
@@ -25,7 +25,8 @@ Commands:
   pull MODEL...                download models
   list                         list downloaded models
   rm MODEL                     delete a downloaded model
-  bench MODEL AUDIO [-n N]     time the model load, the first call and N more calls (10)
+  bench MODEL AUDIO [-n N]     time the model load, the first call and N more calls (10);
+                               takes --backend too
 
 Quick start:
   wavo AUDIO [OPTIONS]         the same as wavo run AUDIO: transcribe with parakeet-v3,
@@ -35,9 +36,12 @@ Run options:
   --json                       print the text and its tokens with start times as JSON
   --srt                        print subtitles
   --segment SECS               split longer audio at pauses into parts of up to SECS
-                               (25 for GigaAM, 30 for Whisper and Moonshine, else 60;
-                               0 for one pass)
+                               (15 on the Neural Engine, 25 for GigaAM, 30 for Whisper
+                               and Moonshine, else 60; 0 for one pass)
   -y, --yes                    download a missing model without asking
+  --backend auto|gpu|ane       where the encoder runs: auto (the default) takes the Neural
+                               Engine for Parakeet and GigaAM once `wavo pull` prepared
+                               them on a Mac, else the GPU
 
 MODEL is a name below, its full name or a path to a .gguf file. AUDIO is wav, mp3, m4a, flac
 or ogg (Vorbis), downmixed to mono and resampled to 16 kHz.
@@ -81,8 +85,7 @@ fn cli(args: &[&str]) -> Result<()> {
     ["pull", names @ ..] if !names.is_empty() => pull(names)?,
     ["list" | "ls"] => list()?,
     ["rm", name] => rm(name)?,
-    ["bench", model, audio] => bench(model, audio, 10)?,
-    ["bench", model, audio, "-n", n] => bench(model, audio, n.parse().context("-n")?)?,
+    ["bench", model, audio, opts @ ..] => bench(model, audio, opts)?,
     // wavo AUDIO, also with run options first: wavo -y AUDIO
     [arg, ..] if arg.starts_with('-') || (!COMMANDS.contains(arg) && Path::new(arg).is_file()) => {
       run(args)?
@@ -136,16 +139,29 @@ fn ask(question: &str) -> bool {
   matches!(answer.trim().to_lowercase().as_str(), "" | "y" | "yes")
 }
 
-fn load(path: &Path) -> Result<wavo::Model> {
-  wavo::Model::load(path).with_context(|| format!("loading {}", path.display()))
+fn load(path: &Path, backend: Backend) -> Result<wavo::Model> {
+  wavo::Model::load_with(path, backend).with_context(|| format!("loading {}", path.display()))
+}
+
+/// The value of `--backend`.
+fn backend(arg: Option<&&str>) -> Result<Backend> {
+  Ok(match arg.copied() {
+    Some("auto") => Backend::Auto,
+    Some("gpu") => Backend::Gpu,
+    Some("ane") => Backend::NeuralEngine,
+    _ => bail!("--backend takes auto, gpu or ane"),
+  })
 }
 
 fn run(args: &[&str]) -> Result<()> {
-  const USAGE: &str = "usage: wavo run [MODEL] AUDIO [--json | --srt] [--segment SECS] [-y]";
+  const USAGE: &str =
+    "usage: wavo run [MODEL] AUDIO [--json | --srt] [--segment SECS] [-y] [--backend B]";
   let (mut format, mut segment, mut download, mut rest) = (None, None, Download::Ask, Vec::new());
+  let mut on = Backend::Auto;
   let mut args = args.iter();
   while let Some(&arg) = args.next() {
     match arg {
+      "--backend" => on = backend(args.next())?,
       "--json" | "--srt" if format.is_none() => format = Some(arg),
       "--segment" if segment.is_none() => {
         let secs = args.next().and_then(|s| s.parse::<u32>().ok()).filter(|&s| s == 0 || s >= 5);
@@ -176,7 +192,7 @@ fn run(args: &[&str]) -> Result<()> {
   bar.set_message("decoding the audio");
   let pcm = audio::read(audio)?;
   bar.set_message("loading the model");
-  let model = load(&path)?;
+  let model = load(&path, on)?;
   let max_ms = segment.or(model.max_audio_ms()).unwrap_or(SEGMENT_MS);
   let ranges = wavo::split(&pcm, if max_ms == 0 { u32::MAX } else { max_ms });
   let n = ranges.len();
@@ -295,13 +311,29 @@ fn list() -> Result<()> {
   let hub = Hub::new();
   let found: Vec<_> =
     MODELS.iter().filter_map(|m| hub.find(m.name).map(|path| (m, path))).collect();
+  // Whether each runs on the Neural Engine; a column only where one can.
+  let ane: Vec<_> = found.iter().map(|(_, path)| wavo::Model::prepared(path)).collect();
+  let column = ane.iter().any(Option::is_some);
   if found.is_empty() {
     eprintln!("no models downloaded; try: wavo pull {}", models::DEFAULT);
   } else {
-    println!("{:<18} {:>7}  PATH", "NAME", "SIZE");
+    println!("{:<18} {:>7}  {}PATH", "NAME", "SIZE", if column { "ANE  " } else { "" });
   }
-  for (m, path) in found {
-    println!("{:<18} {}  {}", m.name, models::gb(std::fs::metadata(&path)?.len()), path.display());
+  for ((m, path), ane) in found.iter().zip(&ane) {
+    let ane = match ane {
+      _ if !column => "",
+      Some(true) => "yes  ",
+      Some(false) => "no   ",
+      None => "-    ",
+    };
+    let size = models::gb(std::fs::metadata(path)?.len());
+    println!("{:<18} {size}  {ane}{}", m.name, path.display());
+  }
+  if let Some(((m, _), _)) = found.iter().zip(&ane).find(|(_, a)| **a == Some(false)) {
+    eprintln!(
+      "ANE no: runs on the GPU until prepared for the Neural Engine; run: wavo pull {}",
+      m.name
+    );
   }
   Ok(())
 }
@@ -315,13 +347,21 @@ fn rm(arg: &str) -> Result<()> {
   Ok(())
 }
 
-/// Load time, first call and warm median/min over `n` calls, in milliseconds.
-fn bench(model: &str, audio: &str, n: usize) -> Result<()> {
+/// Load time, first call and warm median/min over `-n` calls (10), in milliseconds.
+fn bench(model: &str, audio: &str, opts: &[&str]) -> Result<()> {
+  let (mut n, mut on, mut opts) = (10, Backend::Auto, opts.iter());
+  while let Some(&opt) = opts.next() {
+    match opt {
+      "-n" => n = opts.next().and_then(|n| n.parse().ok()).context("-n takes a number")?,
+      "--backend" => on = backend(opts.next())?,
+      _ => bail!("usage: wavo bench MODEL AUDIO [-n N] [--backend B]"),
+    }
+  }
   ensure!(n > 0, "-n must be at least 1");
   let (pcm, path) = (audio::read(audio)?, model_path(model, Download::Never)?);
   let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
   let t = Instant::now();
-  let model = load(&path)?;
+  let model = load(&path, on)?;
   let load = ms(t);
   let mut calls = (0..=n).map(|_| {
     let t = Instant::now();
@@ -332,8 +372,9 @@ fn bench(model: &str, audio: &str, n: usize) -> Result<()> {
   warm.sort_by(f64::total_cmp);
   let median = (warm[(n - 1) / 2] + warm[n / 2]) / 2.0;
   println!(
-    "load {load:.1} ms, first {first:.1} ms, warm median {median:.1} ms, min {:.1} ms",
-    warm[0]
+    "load {load:.1} ms, first {first:.1} ms, warm median {median:.1} ms, min {:.1} ms, on the {}",
+    warm[0],
+    if model.backend() == Backend::NeuralEngine { "Neural Engine" } else { "GPU" }
   );
   Ok(())
 }

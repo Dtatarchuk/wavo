@@ -251,7 +251,8 @@ impl Model {
   /// The file is one of the Q8_0 GGUFs transcribe.cpp publishes (see the
   /// [model table](crate#models)); the family comes from its `general.architecture`. Parakeet and
   /// GigaAM load on the Neural Engine when the file is [prepared](Model::prepare) on a Mac that
-  /// has one, and on the GPU otherwise.
+  /// has one, and on the GPU otherwise. On the Neural Engine a load takes about 0.1 s, but 10–30 s
+  /// the first time in a program that didn't prepare the file itself.
   ///
   /// # Errors
   ///
@@ -404,6 +405,9 @@ impl Model {
   /// It blocks for 15–40 s the first time, mostly while the system compiles the program for the
   /// Neural Engine: run it on a thread of your own, as `Hub::pull` (the `hub` feature), which calls
   /// it after each download, does. A prepared file returns after one load of under a second. The
+  /// system keeps that last compile per program, so prepare in the program that loads the model:
+  /// in another one (a helper that downloads, `wavo pull` for your app) the first load takes as
+  /// long again, and later loads are fast. The
   /// compiled model takes about as much disk as the GGUF, in `~/Library/Caches/wavo/`, named by
   /// a hash of the file's content: copies of the file share it. [`Model::unprepare`] deletes it,
   /// and `prepare` deletes compiled models no load has used for 30 days (of files deleted
