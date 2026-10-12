@@ -10,14 +10,15 @@
   not(feature = "hub"),
   doc = "[hub-mod]: https://docs.rs/wavo/latest/wavo/hub/\n[hub-models]: https://docs.rs/wavo/latest/wavo/hub/static.MODELS.html\n[hub-hub]: https://docs.rs/wavo/latest/wavo/hub/struct.Hub.html\n[hub-pull]: https://docs.rs/wavo/latest/wavo/hub/struct.Hub.html#method.pull"
 )]
-//! Speech-to-text on the GPU, in pure Rust.
+//! Speech-to-text on the GPU or a Mac's Neural Engine, in pure Rust.
 //!
 //! wavo runs the open ASR models that [transcribe.cpp] publishes as GGUF files on Hugging Face:
 //! NVIDIA's Parakeet, Sber's GigaAM, OpenAI's Whisper and Useful Sensors' Moonshine, with the same
 //! text and timestamps as transcribe.cpp. The encoder runs on the GPU through wgpu (Metal on Apple
-//! Silicon, Vulkan on Linux and Windows) with wavo's own kernels; the audio frontend runs on the
-//! CPU, and so does the decoder except Whisper's and Moonshine's. It builds with a plain `cargo
-//! build`: no C++ toolchain, Python or ONNX Runtime.
+//! Silicon, Vulkan on Linux and Windows) with wavo's own kernels, or for Parakeet and GigaAM on
+//! the Neural Engine of an Apple Silicon Mac through Core ML ([below](#neural-engine)); the audio
+//! frontend runs on the CPU, and so does the decoder except Whisper's and Moonshine's. It builds
+//! with a plain `cargo build`: no C++ toolchain, Python or ONNX Runtime.
 //!
 //! [transcribe.cpp]: https://github.com/handy-computer/transcribe.cpp
 //!
@@ -142,15 +143,48 @@
 //! # fn main() {}
 //! ```
 //!
+//! # Long audio
+//!
+//! `transcribe` takes audio of any length (Whisper runs its own 30 s windows), but accuracy drops
+//! past [`Model::max_audio_ms`]. [`Model::transcribe_long`] splits longer audio at its quietest
+//! moments into pieces of up to that length, transcribes them and joins the transcripts, with
+//! token times from the start of the audio. To transcribe the pieces yourself, for example with
+//! progress, take them from [`split`] and shift each piece's token `start_ms` by its start.
+//!
+//! # Neural Engine
+//!
+//! On an Apple Silicon Mac with macOS 15 or later, Parakeet's and GigaAM's encoders also run on
+//! the Neural Engine: on an M1 a call over 11 s of audio takes 52–70 ms there against 170–250 ms
+//! on the GPU. The model needs preparing once, which writes its encoder as a Core ML program and
+//! has the system compile it (15–30 s, and as much disk as the GGUF):
+//! [`Hub::pull`][hub-pull] does it after the download, and [`Model::prepare`] does it for a file
+//! you manage. [`Model::load`] then runs it on the Neural Engine, falling back to the GPU while
+//! the file isn't prepared; [`Model::load_with`] picks a [`Backend`], and [`Model::backend`] tells
+//! which one runs.
+//!
+//! ```no_run
+//! # fn main() -> wavo::Result<()> {
+//! use std::ops::ControlFlow;
+//!
+//! let path = "parakeet-tdt-0.6b-v3-Q8_0.gguf";
+//! wavo::Model::prepare(path, |step| {
+//!   eprintln!("preparing for the Neural Engine: {step:?}");
+//!   ControlFlow::Continue(())
+//! })?; // `false` without a Neural Engine: the model runs on the GPU
+//! let model = wavo::Model::load(path)?;
+//! println!("{:?}, pieces of up to {:?} ms", model.backend(), model.max_audio_ms());
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The Neural Engine runs a fixed 15 s window in F16 with 8-bit weights: shorter audio is padded,
+//! longer audio split at pauses, and the text matches the GPU's on the test clips, while a few
+//! tokens start one or two encoder frames apart. The GPU stays the exact path.
+//!
 //! # Left to the caller
 //!
 //! - **Decoding and resampling.** `transcribe` takes 16 kHz mono `f32` only. Decode other formats,
 //!   downmix to mono and resample yourself; the `wavo` CLI uses `symphonia` and `rubato`.
-//! - **Long audio.** `transcribe` takes audio of any length (Whisper runs its own 30 s windows),
-//!   but accuracy drops past [`Model::max_audio_ms`]. Split longer audio at pauses, transcribe
-//!   the pieces and shift their tokens' `start_ms` by each piece's offset, as `wavo run` does
-//!   in [`src/cli/split.rs`](https://github.com/vladkens/wavo/blob/main/src/cli/split.rs): it
-//!   cuts at the quietest moments by frame energy.
 //! - **Voice activity detection and streaming.** Neither is built in: pass whole recordings or the
 //!   pieces your own VAD cuts.
 #![cfg_attr(docsrs, feature(doc_cfg))]

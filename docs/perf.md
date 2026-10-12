@@ -60,6 +60,15 @@ caches, and the `<s>` step. The decoder is Whisper's step on the GPU with SwiGLU
 k, ending in an argmax, so a token reads back 4 bytes; EOS, the 194-position cap and the
 repetition guard run on the CPU.
 
+**Neural Engine (Parakeet, GigaAM).** `Model::prepare` writes the encoder (subsampling, blocks,
+head projection) as one Core ML ML Program (`src/ane/`, opset CoreML8) over a fixed 15 s window:
+Q8_0 linear weights re-quantized to int8 with an F16 scale per output row
+(`constexpr_blockwise_shift_scale`), the rest F16, relative positions projected on the CPU into a
+constant per block, BatchNorm folded into the depthwise conv. Per call the CPU mel (padded with
+zeros to the window, F16), per-stage frame masks and an additive key mask go in, the head's
+projection `[t][width]` in F16 comes out, and the decoders run as on the GPU path. The system
+compiles the program for the ANE at the first load per program (10–30 s) and caches it.
+
 ## Not tried yet
 
 GigaAM:
@@ -652,6 +661,39 @@ Numbers are in the plans' "## Result" sections.
 - 2026-10-09, GigaAM, phase 1 baseline: warm on par, peak 878 / 880 / 925 vs 322 / 324 / 333 MiB.
   Portable kernels only: 85.1 / 203.1 / 808.4 vs 46.4 / 99.6 / 311.2 ms (ru-long attention 370 ms
   with the scores in memory, GEMM 425 ms). [GigaAM plan](plans/completed/20261009-gigaam-e2e-rnnt.md).
+
+### Neural Engine
+
+Warm ms of `wavo bench` (11 calls), jfk 11 s / dots 35.3 s (3 pieces on the ANE) / ru 4.5 s,
+order GPU, ANE, ref, ref, ANE, GPU; [plan](plans/completed/20261011-ane.md).
+
+- 2026-10-12, M1 (macOS 15.8, quiet): Parakeet V3 ANE 69.7 / 250 / 53.0, GPU 252 / 643 / 115,
+  transcribe.cpp 295 / 968 / 142; GigaAM v3 ANE 52.2 / 178 / 42.0, GPU 170 / 430 / 70.5,
+  transcribe.cpp 180 / 523 / 74. Load on the ANE 100–145 ms, first call 54–82 ms (jfk, ru).
+  Process peak footprint ANE 21 / 16 MiB against GPU 780 / 315 MiB (Parakeet / GigaAM): the
+  weights live in the system's ANE service.
+- 2026-10-12, M2 (macOS 27, load average 15–35 from other jobs): Parakeet V3 ANE 56.7 / 206 /
+  77, GPU 150 / 440 / 104, transcribe.cpp 221 / 816; GigaAM v3 ANE 54.4 / 165–200 / 44.1, GPU
+  99 / 316 / 51, transcribe.cpp 112 / 395–422 / 56.
+- 2026-10-12, first prepare (fresh program name, so no system cache): M2 Parakeet V3 14.4 s
+  (build 1.9, compile 0.3, ANE load 12.2), GigaAM 11.7 s (0.6 / 0.1 / 11.0); M1 26.2 / 22.6 s.
+  The system caches the ANE compile per program: a load in another program than the one that
+  prepared takes as long once (M2 10.5–11.8 s, M1 21.5–24.8 s), then 0.06–0.15 s. Compiled
+  sizes 680 MB (Parakeet) and 254 MB (GigaAM).
+- 2026-10-12, Parakeet V3 accuracy against the GPU on the same 15 s pieces of 7 clips (637
+  tokens): per-row int8 on the ANE 11 tokens moved, at most 560 ms (ru-long's final "." in a
+  trailing pause), one word differs (uk-long); F16 weights on the M1's ANE (one 1.1 GB program
+  fits there, not on the M2) 11 moved, at most 160 ms, a capital letter at a piece start; F16 on
+  Core ML's GPU exact; int8 on Core ML's GPU 3 moved and a comma lost. The 160 ms token on jfk
+  (`▁your`, p = 0.925) comes from the ANE's arithmetic: same with F16 weights. Kept per-row int8
+  in one program (650 MB, fits the M2, the spike's 35 vs 45 ms for two F16 halves).
+- 2026-10-12, rejected: F16 for attention, for the FF down-projections, or both (one program
+  under 1 GiB on the M2): the same 11 moved tokens as all-int8. Per-row scales chosen by least
+  squared error (50–100% of the max) instead of the max: 8 moved instead of 11, the same outliers,
+  4× slower build. LayerNorm input scaled by 1/16: no change (per-block cosine against Core ML's
+  GPU falls from 0.99999 to 0.99985 over the blocks, then 0.9994 after the last `norm_out`).
+- 2026-10-12, Parakeet V3 jfk on the M2: the spike's 35 ms encoder becomes 55 ms per call with
+  the mel, F16 input conversion and the TDT decoder; GigaAM 41 ms on ru-short.
 
 ### Research branch (all weights expanded to F32)
 
