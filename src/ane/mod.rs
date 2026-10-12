@@ -16,6 +16,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub use conformer::Graph;
 pub use coreml::{Model, available};
@@ -88,6 +89,7 @@ pub fn load(path: &Path) -> Result<Model> {
       "the model is not prepared for the Neural Engine: run `wavo pull` or wavo::Model::prepare",
     ));
   }
+  touch(&compiled);
   Model::load(&compiled)
 }
 
@@ -106,11 +108,12 @@ pub fn prepare(
   let target = compiled(path)?;
   let dir = target.parent().unwrap();
   fs::create_dir_all(dir)?;
+  prune(dir);
   let lock = File::create(target.with_extension("lock"))?;
   lock.lock()?;
   if !target.is_dir() {
     step(PrepareStep::Build)?;
-    let tmp = target.with_extension(format!("tmp{}", std::process::id()));
+    let tmp = target.with_extension("tmp"); // one per model: under the lock
     let _ = fs::remove_dir_all(&tmp);
     let built = (|| {
       let package = tmp.join("model.mlpackage");
@@ -126,6 +129,7 @@ pub fn prepare(
     built?;
   }
   step(PrepareStep::Load)?;
+  touch(&target);
   Model::load(&target)?;
   Ok(true)
 }
@@ -151,6 +155,26 @@ pub fn remove(key: &str) -> Result<u64> {
 /// Deletes the GGUF's compiled models; returns the bytes freed.
 pub fn unprepare(path: &Path) -> Result<u64> {
   key(path)?.map_or(Ok(0), |key| remove(&key))
+}
+
+/// Marks a compiled model as used now, for `prune`.
+fn touch(compiled: &Path) {
+  let _ = File::create(compiled.with_extension("used"));
+}
+
+/// Deletes compiled models unused for 30 days: those of GGUFs deleted behind wavo's back (`hf
+/// cache rm`, another cache folder) and of older graph versions.
+fn prune(dir: &Path) {
+  const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
+  for path in fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()) {
+    let used = fs::metadata(path.with_extension("used")).or_else(|_| fs::metadata(&path));
+    let old = used.and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|a| a > MAX_AGE));
+    if path.extension().is_some_and(|e| e == "mlmodelc") && old {
+      let _ = fs::remove_dir_all(&path);
+      let _ = fs::remove_file(path.with_extension("used"));
+      let _ = fs::remove_file(path.with_extension("lock"));
+    }
+  }
 }
 
 fn size(path: &Path) -> u64 {

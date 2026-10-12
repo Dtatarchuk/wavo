@@ -225,7 +225,8 @@ const AUTO: &[(&str, Backend)] = &[
 ];
 
 /// The families with a Neural Engine program, and the function that writes it.
-const NEURAL_ENGINE: &[(&str, ane::Build)] = &[("parakeet", parakeet::ane::build)];
+const NEURAL_ENGINE: &[(&str, ane::Build)] =
+  &[("parakeet", parakeet::ane::build), ("gigaam", gigaam::ane::build)];
 
 /// What [`Model::prepare`] is doing, passed to its callback when each step starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,7 +303,7 @@ impl Model {
     };
     let backend = if ane.is_some() { Backend::NeuralEngine } else { Backend::Gpu };
     let family = match arch {
-      "gigaam" => Family::Gigaam(Box::new(gigaam::Gigaam::load(&g)?)),
+      "gigaam" => Family::Gigaam(Box::new(gigaam::Gigaam::load(&g, ane)?)),
       "parakeet" => Family::Parakeet(Box::new(parakeet::Parakeet::load(&g, ane)?)),
       "whisper" => Family::Whisper(Box::new(whisper::Whisper::load(&g)?)),
       "moonshine" => Family::Moonshine(Box::new(moonshine::Moonshine::load(&g)?)),
@@ -404,9 +405,10 @@ impl Model {
   /// Neural Engine: run it on a thread of your own, as `Hub::pull` (the `hub` feature), which calls
   /// it after each download, does. A prepared file returns after one load of under a second. The
   /// compiled model takes about as much disk as the GGUF, in `~/Library/Caches/wavo/`, named by
-  /// a hash of the file's content: copies of the file share it. [`Model::unprepare`] deletes it.
-  /// `progress` is called as each step starts; return [`ControlFlow::Break`] to cancel before the
-  /// next.
+  /// a hash of the file's content: copies of the file share it. [`Model::unprepare`] deletes it,
+  /// and `prepare` deletes compiled models no load has used for 30 days (of files deleted
+  /// elsewhere). `progress` is called as each step starts; return [`ControlFlow::Break`] to
+  /// cancel before the next.
   ///
   /// # Errors
   ///

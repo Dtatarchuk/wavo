@@ -180,6 +180,30 @@ fn gigaam_v3_ctc() {
   check("gigaam-v3-ctc", GIGAAM);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn gigaam_v3_e2e_rnnt_ane() {
+  check_ane("gigaam-v3-e2e-rnnt", 40, GIGAAM);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn gigaam_v3_e2e_ctc_ane() {
+  check_ane("gigaam-v3-e2e-ctc", 40, GIGAAM);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn gigaam_v3_rnnt_ane() {
+  check_ane("gigaam-v3-rnnt", 40, GIGAAM);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn gigaam_v3_ctc_ane() {
+  check_ane("gigaam-v3-ctc", 40, GIGAAM);
+}
+
 #[test]
 fn parakeet_tdt_v2() {
   check("parakeet-tdt-0.6b-v2", &["jfk", "dots", "jobs-silence"]);
