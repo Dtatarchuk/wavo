@@ -46,6 +46,7 @@ struct Kernels {
   layer_norm: Pipeline,
   im2col: Pipeline,
   conv_glu: Pipeline,
+  flash: Pipeline,
   scores: Pipeline,
   softmax: Pipeline,
   values: Pipeline,
@@ -73,6 +74,7 @@ impl Kernels {
       layer_norm: pipeline(device, &ops, "layer_norm", &[]),
       im2col: pipeline(device, &ops, "im2col", &[]),
       conv_glu: pipeline(device, &ops, "conv_glu", &[]),
+      flash: pipeline(device, &attention, "flash", &[]),
       scores: pipeline(device, &attention, "scores", &[]),
       softmax: pipeline(device, &ops, "softmax", &[]),
       values: pipeline(device, &attention, "values", &[]),
@@ -91,8 +93,9 @@ impl Kernels {
 }
 
 /// The fast GEMMs (per weight type 4F- and 8F-row tiles), LayerNorm, conv_glu, flash attention and
-/// relative attention, before their probes. Only the GEMM runs with F = 16: the flash kernels need
-/// 8×8 F32 matrices, and on an RTX 4060 the fast LayerNorm and conv_glu were slower.
+/// relative attention, before their probes. With F = 16 only the GEMM and flash attention (its own
+/// kernel on f16 operands): relative attention needs 8×8 F32 matrices, and on an RTX 4060 the fast
+/// LayerNorm and conv_glu were slower.
 type FastPipelines = (Vec<Pipeline>, [Option<Pipeline>; 4]);
 
 /// Compiles the fast kernels for F×F cooperative matrices; `None` if any fails.
@@ -121,16 +124,21 @@ fn compile_fast(device: &wgpu::Device, f: usize) -> Option<FastPipelines> {
       pipeline(device, &relative, "attention", &[]),
     ]
   });
-  let kernels = kernels.map(|k| k.map(Some)).unwrap_or_default();
+  let kernels = kernels.map(|k| k.map(Some)).unwrap_or_else(|| {
+    let flash = module(device, include_str!("flash_f16.wgsl"));
+    [None, None, Some(pipeline(device, &flash, "flash", &[])), None]
+  });
   let errors = scopes.into_iter().rev().filter_map(|s| pollster::block_on(s.pop())).count();
   (errors == 0).then_some((gemm, kernels))
 }
 
-/// Kernels for one decoder token: `gemv` and `embed` per weight type, `attend` and `pack`.
+/// Kernels for one decoder token: `gemv` and `embed` per weight type, `attend`, `combine` and
+/// `pack`.
 struct Decoder {
   gemv: Vec<Pipeline>,
   embed: Vec<Pipeline>,
   attend: Pipeline,
+  combine: Pipeline,
   pack: Pipeline,
 }
 
@@ -141,8 +149,11 @@ struct Fast {
   gemm: Option<Vec<Pipeline>>,
   layer_norm: Option<Pipeline>,
   conv_glu: Option<Pipeline>,
-  /// Flash attention for head_dim 32..64.
+  /// Flash attention: `flash.wgsl` (F = 8, head_dim 32..64) or `flash_f16.wgsl` (F = 16,
+  /// head_dim ≤ 64), both in steps of 4.
   attention: Option<Pipeline>,
+  /// F of the kept flash attention, independent of the GEMM's probe; 0 without it.
+  attention_size: usize,
   /// Flash attention with relative positions for head_dim ≤ 128.
   relative: Option<Pipeline>,
 }
@@ -340,13 +351,15 @@ impl Gpu {
     // All six GEMMs are taken before any is checked, so the kernels after them stay in place.
     let gemm: Vec<_> = (0..6).map(|_| next()).collect();
     let gemm: Option<Vec<_>> = gemm.into_iter().collect();
+    let (layer_norm, conv_glu, attention, relative) = (next(), next(), next(), next());
     Fast {
       size: if gemm.is_some() { size } else { 0 },
       gemm,
-      layer_norm: next(),
-      conv_glu: next(),
-      attention: next(),
-      relative: next(),
+      layer_norm,
+      conv_glu,
+      attention_size: if attention.is_some() { size } else { 0 },
+      attention,
+      relative,
     }
   }
 
@@ -500,6 +513,7 @@ impl Gpu {
         gemv: gemms(device, gemm, "gemv"),
         embed: gemms(device, gemm, "embed"),
         attend: pipeline(device, &decode, "attend", &[]),
+        combine: pipeline(device, &decode, "combine", &[]),
         pack: pipeline(device, &decode, "pack", &[]),
       }
     })
@@ -520,14 +534,26 @@ impl Gpu {
   }
 
   fn flash(&self, head_dim: usize, relative: bool) -> Option<&Pipeline> {
-    let (k, min, max) =
-      if relative { (&self.fast.relative, 8, 128) } else { (&self.fast.attention, 32, 64) };
-    k.as_ref().filter(|_| (min..=max).contains(&head_dim) && head_dim.is_multiple_of(8))
+    let (k, min, max, step) = match (relative, self.fast.attention_size) {
+      (true, _) => (&self.fast.relative, 8, 128, 8),
+      (false, 8) => (&self.fast.attention, 32, 64, 4),
+      (false, _) => (&self.fast.attention, 4, 64, 4),
+    };
+    k.as_ref().filter(|_| (min..=max).contains(&head_dim) && head_dim.is_multiple_of(step))
   }
 
-  /// Floats of attention scratch for `t` frames: the portable path keeps all scores.
+  /// Whether the portable path has a flash kernel for heads of `head_dim`.
+  fn portable_flash(head_dim: usize, relative: bool) -> bool {
+    !relative && head_dim <= 64 && head_dim.is_multiple_of(4)
+  }
+
+  /// Floats of attention scratch for `t` frames: the portable path without flash attention keeps
+  /// all scores.
   pub fn scores_len(&self, t: usize, heads: usize, head_dim: usize, relative: bool) -> usize {
-    if self.flash(head_dim, relative).is_some() { 1 } else { heads * t * t }
+    match self.flash(head_dim, relative).is_some() || Self::portable_flash(head_dim, relative) {
+      true => 1,
+      false => heads * t * t,
+    }
   }
 
   fn begin(&self) -> (wgpu::CommandEncoder, wgpu::ComputePass<'static>) {
@@ -590,6 +616,14 @@ fn fail(failure: &Mutex<Option<String>>, message: String) {
   failure.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert(message);
 }
 
+/// Keys per workgroup of `Pass::attend`.
+const ATTEND_KEYS: usize = 256;
+
+/// Floats of `Pass::attend`'s scratch for up to `n` keys.
+pub fn attend_len(n: usize, heads: usize, head_dim: usize) -> usize {
+  n.div_ceil(ATTEND_KEYS) * heads * (head_dim + 2)
+}
+
 /// Rows of projected positions for relative attention over `t` frames: positions t + 15 down to
 /// 1 − t. The first 16 are only read by the fast kernel's partial tiles, as are 64 more rows past
 /// the end, which a buffer must have (finite) too.
@@ -617,9 +651,9 @@ fn adapter() -> Result<wgpu::Adapter> {
 
 /// F of the F×F cooperative matrices the fast kernels use on `adapter`, which needs 32-lane
 /// subgroups: 8 with 8×8 matrices of F32 and of F16 into F32 (Apple GPUs; all fast kernels), else
-/// 16 with 16×16 F16 into F32 (only the GEMM), on NVIDIA only so far. AMD's Windows driver
-/// (25.10, Radeon 610M) reports the same 16×16 shape but crashes the process while compiling any
-/// shader that uses it, which no probe can catch; other drivers are untested.
+/// 16 with 16×16 F16 into F32 (the GEMM and flash attention), on NVIDIA only so far. AMD's Windows
+/// driver (25.10, Radeon 610M) reports the same 16×16 shape but crashes the process while compiling
+/// any shader that uses it, which no probe can catch; other drivers are untested.
 fn fast_size(adapter: &wgpu::Adapter) -> Option<usize> {
   use wgpu::CooperativeScalarType::{F16, F32};
   let info = adapter.get_info();
@@ -830,16 +864,24 @@ impl<'a> Pass<'a> {
   }
 
   /// Attention of one query per head, `q` `[heads · head_dim]`, over keys 0..n of an F16 cache
-  /// into `o`. A cache row is K of all heads, then V, as f16 pairs.
-  pub fn attend(&mut self, q: &Buffer, kv: &Buffer, o: &Buffer, n: usize, heads: usize, hd: usize) {
+  /// into `o`, through `part` (`attend_len` floats). A cache row is K of all heads, then V, as f16
+  /// pairs.
+  #[allow(clippy::too_many_arguments)]
+  pub fn attend(
+    &mut self,
+    q: &Buffer,
+    kv: &Buffer,
+    part: &Buffer,
+    o: &Buffer,
+    n: usize,
+    heads: usize,
+    hd: usize,
+  ) {
     let scale = (1.0 / (hd as f32).sqrt()).to_bits();
-    let (stride, v) = ((heads * hd) as u32, (heads * hd / 2) as u32);
-    self.run(
-      &self.gpu.decoder().attend,
-      &[q, kv, o],
-      &[n as u32, hd as u32, scale, stride, v],
-      [heads, 1, 1],
-    );
+    let params = [n as u32, hd as u32, scale, (heads * hd) as u32, (heads * hd / 2) as u32];
+    let k = self.gpu.decoder();
+    self.run(&k.attend, &[q, kv, part], &params, [n.div_ceil(ATTEND_KEYS), heads, 1]);
+    self.run(&k.combine, &[part, o], &params, [heads, 1, 1]);
   }
 
   /// Packs `pairs` pairs of floats from `x[src..]` into f16 pairs at `y[dst..]`.
@@ -886,8 +928,9 @@ impl<'a> Pass<'a> {
   /// without `v` over `qk` `[t][q | k | v]`. With relative positions `pos`, the projected positions
   /// `[pos_rows(t)][heads · head_dim]` (row r is position t + 15 − r), it is over `qk`
   /// `[t][q + u | k | v | q + v]` (no `v`): score (i, j) is then `((q + u)_i·k_j + (q + v)_i·pos[j
-  /// − i + t + 15]) / √head_dim`. `s` holds `scores_len` floats. The fast path reads rows of `qk`
-  /// and `v` up to `t` rounded up to 64, which must be finite.
+  /// − i + t + 15]) / √head_dim`. `s` holds `scores_len` floats. Apple's fast path reads rows of
+  /// `qk` and `v` up to `t` rounded up to 64, which must be finite, and with heads of 4·(2k + 1)
+  /// dims 4 floats past the last row of `v`.
   #[allow(clippy::too_many_arguments)]
   pub fn attention(
     &mut self,
@@ -916,6 +959,9 @@ impl<'a> Pass<'a> {
       return self.run(k, buffers, &params[..7 + d as usize], [t.div_ceil(queries), heads, 1]);
     }
     let (k, tiles) = (&self.gpu.kernels, t.div_ceil(16));
+    if Gpu::portable_flash(head_dim, d == 1) {
+      return self.run(&k.flash, &[qk, v, o], &params[..7], [t.div_ceil(32), heads, 1]);
+    }
     self.run(&k.scores, &[qk, pos, s], &params, [tiles, tiles, heads]);
     self.run(&k.softmax, &[s], &params[..1], [t, heads, 1]);
     self.run(&k.values, &[s, v, o], &params, [tiles, heads, 1]);
@@ -999,10 +1045,11 @@ mod tests {
       let fast = Gpu::new(true).unwrap();
       let f = &fast.fast;
       let ops = [&f.layer_norm, &f.conv_glu, &f.attention, &f.relative];
-      // With 16×16 matrices only the GEMM.
+      // With 16×16 matrices only the GEMM and flash attention.
       if let Some(size) = fast_size(&adapter().unwrap()) {
+        let want = [size == 8, size == 8, true, size == 8];
         assert!(
-          f.gemm.is_some() && ops.iter().all(|k| k.is_some() == (size == 8)),
+          f.gemm.is_some() && ops.iter().zip(want).all(|(k, w)| k.is_some() == w),
           "a fast kernel failed its probe"
         );
       }
@@ -1035,10 +1082,14 @@ mod tests {
   }
 
   fn assert_close(got: &[f32], want: &[f32]) {
+    assert_near(got, want, 2e-5);
+  }
+
+  fn assert_near(got: &[f32], want: &[f32], tolerance: f32) {
     assert_eq!(got.len(), want.len());
     let scale = want.iter().fold(1f32, |m, x| m.max(x.abs()));
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
-      assert!((g - w).abs() <= 2e-5 * scale, "[{i}]: {g} vs {w}");
+      assert!((g - w).abs() <= tolerance * scale, "[{i}]: {g} vs {w}");
     }
   }
 
@@ -1113,6 +1164,8 @@ mod tests {
     gemm[0] = gpu.kernels.gemm[0].clone();
     let fast = gpu.probe(size, (gemm, kernels.clone()));
     assert!(fast.gemm.is_none() && fast.size == 0);
+    // Flash attention keeps its own F, which picks its head sizes.
+    assert_eq!(fast.attention_size, if fast.attention.is_some() { size } else { 0 });
     assert!([fast.layer_norm, fast.conv_glu, fast.attention, fast.relative] == kernels);
   }
 
@@ -1305,7 +1358,7 @@ mod tests {
   #[test]
   fn attend_and_pack() {
     let half = |x: f32| f16::from_f32(x).to_f32();
-    // Moonshine's heads of 36; past 2048 keys the kernel goes in blocks.
+    // Moonshine's heads of 36; the kernel splits the keys into parts of 256.
     let keys = 4100;
     for (heads, hd) in [(2, 40), (3, 36)] {
       let d = heads * hd;
@@ -1315,7 +1368,8 @@ mod tests {
       for gpu in gpus() {
         let (qb, xb) = (up(gpu, &q), up(gpu, &kv));
         let cache = gpu.buffer(keys * d);
-        for n in [1, 37, 1500, 2049, keys] {
+        let part = gpu.buffer(attend_len(keys, heads, hd));
+        for n in [1, 37, 256, 257, 1500, 2049, keys] {
           let mut want = vec![0.0; d];
           for h in 0..heads {
             let s: Vec<f32> = (0..n)
@@ -1335,7 +1389,7 @@ mod tests {
           }
           let got = run(gpu, &vec![0.0; d], |p, o| {
             p.pack(&xb, &cache, keys * d, 0, 0);
-            p.attend(&qb, &cache, o, n, heads, hd);
+            p.attend(&qb, &cache, &part, o, n, heads, hd);
           });
           assert_close(&got, &want);
         }
@@ -1394,12 +1448,14 @@ mod tests {
   #[test]
   fn attention() {
     // head_dim 56: the flash kernel's last 8 columns stay out.
-    for (t, hd) in [(37usize, 48), (100, 48), (100, 56)] {
+    for (t, hd) in [(37usize, 48), (100, 48), (100, 56), (5, 36), (70, 52), (100, 64), (40, 80)] {
       let heads = 2;
       let d = heads * hd;
-      // The fast path reads rows up to t rounded up to 64.
-      let qk = random(t.next_multiple_of(64) * 2 * d, 15);
-      let v = random(t.next_multiple_of(64) * d, 16);
+      // The fast path reads rows up to t rounded up to 64 (8×8: and 4 floats past the last v row).
+      // Values exact in f16, as the 16×16 tier rounds them (and the probabilities) to f16.
+      let half = |x: f32| f16::from_f32(x).to_f32();
+      let qk: Vec<f32> = random(t.next_multiple_of(64) * 2 * d, 15).into_iter().map(half).collect();
+      let v: Vec<f32> = random(t.next_multiple_of(64) * d + 4, 16).into_iter().map(half).collect();
       let scale = 1.0 / (hd as f32).sqrt();
       let mut want = vec![0.0; t * d];
       for h in 0..heads {
@@ -1424,7 +1480,8 @@ mod tests {
         let got = run(gpu, &vec![0.0; t * d], |p, o| {
           p.attention(&qb, Some(&vb), None, &s, o, t, heads, hd)
         });
-        assert_close(&got, &want);
+        let wide = gpu.fast.attention_size == 16 && gpu.flash(hd, false).is_some();
+        assert_near(&got, &want, if wide { 1e-3 } else { 2e-5 });
       }
     }
   }

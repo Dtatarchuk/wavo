@@ -22,8 +22,9 @@ portable path (`Pass::layers`). The fast kernels (cooperative-matrix GEMM on f16
 Q8_0/F16 dequantized while staging and W rounded to f16 as the reference does, barrier-free flash
 attention with the output in registers, one subgroup per row for LayerNorm and the conv module)
 each turn on after a probe dispatch. On NVIDIA GPUs, which have 16×16 F16 matrices instead of
-8×8 F32 ones, only the GEMM is fast, on 16×16 fragments, and a GEMM of fewer than 16 such
-workgroups runs the portable one. The head's linear layer is the last GEMM: the joint's encoder
+8×8 F32 ones, the GEMM (a GEMM of fewer than 16 such workgroups runs the portable one) and flash
+attention (its own kernel, `flash_f16.wgsl`, on f16 operands) are fast; without cooperative
+matrices attention is the portable flash kernel. The head's linear layer is the last GEMM: the joint's encoder
 projection for RNN-T, the logits (rows padded to 64) for CTC. The RNN-T loop (LSTM, joint, argmax)
 runs on one CPU thread with NEON (AVX2 + FMA on x86) tiles that score two frames per pass over the
 joint weights; CTC is an argmax and collapse per frame.
@@ -53,7 +54,7 @@ no-speech run on the CPU, and windows advance as the reference's seek loop.
 (computed on the CPU) sized for the longest input so far. One submission (one per layer on the
 portable path) holds the conv stem over the raw samples (im2col and GEMM with tanh, a one-workgroup
 GroupNorm, two more convs with GELU), the shared pre-LN blocks of `src/transformer.rs` with rotary
-q and k and portable attention (heads of 36 and 52 dims), the cross `[K | V]` packed into F16
+q and k and flash attention (heads of 36 and 52 dims), the cross `[K | V]` packed into F16
 caches, and the `<s>` step. The decoder is Whisper's step on the GPU with SwiGLU and rotary q and
 k, ending in an argmax, so a token reads back 4 bytes; EOS, the 194-position cap and the
 repetition guard run on the CPU.
@@ -84,24 +85,23 @@ Conformer families (31 ms per window, a third of the energy) is costed in [Other
 engines](plans/20261010-other-engines.md).
 
 Whisper, open in [the Whisper plan](plans/completed/20261010-whisper.md) (Task 6): decoder gemv bandwidth
-against ~100 GB/s, LayerNorm folded into the next gemv, the two prompt tokens as one two-row step,
-cross attention split over key blocks.
+against ~100 GB/s, LayerNorm folded into the next gemv, the two prompt tokens as one two-row step.
 
 GPUs without cooperative matrices, open in [the Linux plan](plans/20261010-linux.md) (Tasks 5
 and 7): profile the portable encoder with GPU timestamps; subgroup LayerNorm and conv_glu at any
 subgroup width, apart from the cooperative-matrix gate; a register-tiled GEMM with Q8_0/F16
-dequantized in registers (optionally F16 math); flash attention without cooperative matrices;
+dequantized in registers (optionally F16 math);
 Parakeet's fixed cost per call (`first_depthwise`, frames padded to 64); with the person's
 approval, since it changes arithmetic, an int8 GEMM (`dot4I8Packed`) on Q8_0 activations as the
 reference's CPU path does.
 
-GPUs with 16×16 F16 cooperative matrices ([plan](plans/completed/20261011-nvidia-fast.md)): flash
-attention on them, the largest gain left (on an RTX 4060 the portable attention is 471 of 633 ms
-of kernels on Whisper turbo, the reference's whole encoder 160 ms; it would round q, k, v and the
-probabilities to f16, which the fixtures must survive); Whisper's decoder on large models (gemv
-140 + attend 115 ms on large-v3 `jfk`, the reference's whole decoder 249 ms); the GEMM under 16
-workgroups (split-K or a 64-wide tile); the tier on AMD (a Radeon 610M's driver crashed, see the
-Log; RDNA3 and newer drivers untested) and Intel Arc.
+GPUs with 16×16 F16 cooperative matrices ([plan](plans/completed/20261011-nvidia-fast.md)):
+Whisper's decoder on large models (gemv 140 + attend 65 ms on large-v3 `jfk`, the reference's
+whole decoder 249 ms); Parakeet's relative attention, still the portable scores, softmax and
+values (~58 of ~120 ms of kernels on V3 `dots`), as a flash kernel on 16×16 matrices or a portable
+one (which would help the N100 too); the GEMM under 16 workgroups (split-K or a 64-wide tile); the
+tier on AMD (a Radeon 610M's driver crashed, see the Log; RDNA3 and newer drivers untested) and
+Intel Arc.
 
 Load: compiling the pipelines while the weights upload (~7 ms, but every kernel lookup would
 wait on a thread); starting the device while the GGUF header is read (≤ 3 ms left).
@@ -235,6 +235,51 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### Attention
 
+- 2026-10-12, Moonshine, M2: Apple's 8×8 flash kernel for heads of a multiple of 4 (36, 52)
+  instead of the portable one: a last fragment of 4 columns takes q from a zero-padded copy in
+  shared memory (k's extra columns then add zeros), reads 4 floats past each v row and writes
+  only its first 4 output columns; Moonshine's qkv rows padded to 64 (+4 floats). A/B/A: `dots`
+  tiny 271 / 236 / 277, base 445 / 386 / 442 ms; fixtures exact. Kept. Staging that copy only
+  for such heads: GigaAM `ru` 41.1 / 41.9 / 41.2 with it always, within noise without.
+  - The partial fragment as a branch inside the d loop fails validation: Naga treats the loop
+    variable as non-uniform around cooperative-matrix loads, so the tail is its own block.
+- 2026-10-12, Whisper and Moonshine decoder: `attend` split over workgroups of 256 keys per head
+  (each writes its maximum, sum and unnormalized output) and a `combine` dispatch per head that
+  merges them, always both dispatches so a step's dispatch list (and its cached bind groups)
+  doesn't depend on the number of keys. One workgroup per head had left most of the GPU idle (8
+  heads on Moonshine). RTX 4060 A/B/A: whisper-turbo `jfk` 206.8 / 201.4 / 207.2, `ru-long`
+  493.5 / 472.4 / 495.0, large-v3 `jfk` 472.9 / 420.7 / 472.5, tiny 29.2 / 23.3 / 28.0, Moonshine
+  `dots` tiny 112.4 / 90.7 / 112.4, base 190.3 / 140.6 / 190.4 ms. M2: Moonshine `dots` tiny 292 /
+  278 / 295, base 489 / 447 / 488, whisper-tiny `jfk` 74.5 / 68.7 / 74.5 ms, turbo within noise.
+  Fixtures exact. Kept.
+- 2026-10-12, Whisper, Moonshine and GigaAM, RTX 4060: flash attention on 16×16 F16 cooperative
+  matrices (`flash_f16.wgsl`, after ggml's `flash_attn_cm1.comp`): four subgroups take 64
+  queries, k and v staged as f16 per 64-key block, q and output fragments in registers, the
+  scores and f16 probabilities through shared memory (45 KB). A/B/A against the portable flash
+  kernel: whisper-turbo `jfk` 260 / 207 / 260, `ru-long` 602 / 495 / 603, large-v3 `jfk` 528 /
+  471 / 528, tiny 31.2 / 29.2 / 30.1, GigaAM `ru-long` 75.2 / 70.4 / 75.0, Moonshine `dots` tiny
+  114.9 / 112.2 / 114.7, base 194.5 / 190.3 / 194.4 ms; fixtures exact. Kept. Turbo `jfk` per
+  call: attention 86 → 39 ms (~9.5 TFLOP/s).
+  - A row maximum that moves only when passed by more than 8 (flash.wgsl's, fewer rescales):
+    the same speed, but GigaAM e2e-ctc `ru-short` emitted a token a frame late. Rejected for the
+    exact maximum.
+- 2026-10-12, Whisper, Moonshine and GigaAM, portable flash attention for heads of ≤ 64 dims (a
+  multiple of 4) without relative positions: a workgroup of 128 threads takes 32 queries of one
+  head and walks the keys in blocks of 32 (q, k transposed and v in shared memory, 21 KB), each
+  thread scoring 2 queries × 4 keys and summing 2 × 8 output columns, online softmax; no scores
+  in memory. RTX 4060 A/B/A: whisper-turbo `jfk` 639 / 260 / 642, `ru-long` 1365 / 603 / 1370,
+  GigaAM `ru-long` 124 / 79 / 124, Moonshine tiny `dots` 138 / 115 / 138, base 228 / 194 / 228
+  ms; Parakeet unchanged. M1 A/B/A (main / this / main), Moonshine `dots` tiny 1021 / 835 / 1005,
+  base 1980 / 1467 / 2030 ms (main's base spread wide; first and last main within 3%); on the M2
+  only a rough A/B on a busy machine: tiny 424 → 302, base 687 → 498 ms, peak 187 → 120 and 259 →
+  194 MiB (reference 138 / 236). Fixtures exact (all 21 models on the RTX 4060, M2).
+  Kept. Turbo `jfk` on the RTX 4060 after it, GPU timestamps per call: attention 473 → 86 ms,
+  GEMM 122, decoder gemv 23.5 and attend 13 ms. With the split decoder attention below, the N100:
+  whisper-tiny `jfk` / `dots` 2269 / 5016 → 759 / 1988 ms (reference Vulkan 1340 / 3052).
+  - On the M2 in place of the 8×8 `flash.wgsl`: turbo `jfk` 1232 → 1926, GigaAM `ru-long` 248 →
+    333 ms. Not used there.
+  - Writing a vector component by a runtime index (`a[i][r % 2u] = x` on a workgroup array of
+    vectors) gave NaN on the M2: the staging writes whole vectors instead.
 - 2026-10-11, Whisper and Moonshine, decoder `attend` in blocks of 2048 keys with an online
   softmax, so cross-attention takes any length (Moonshine runs one pass over the whole input):
   bit-identical up to 2048 keys; whisper-tiny `jfk` on the RTX 4060 50.0 / 51.2 / 51.5 ms on main,
