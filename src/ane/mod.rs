@@ -130,18 +130,27 @@ pub fn prepare(
   Ok(true)
 }
 
-/// Deletes the GGUF's compiled models of every graph version; returns the bytes freed.
-pub fn unprepare(path: &Path) -> Result<u64> {
+/// What names the GGUF's compiled models, for `remove`; `None` off macOS, where there are none.
+pub fn key(path: &Path) -> Result<Option<String>> {
+  if cfg!(target_os = "macos") { hash(path).map(Some) } else { Ok(None) }
+}
+
+/// Deletes the compiled models of every graph version named by `key`; returns the bytes freed.
+pub fn remove(key: &str) -> Result<u64> {
   let Ok(dir) = cache() else { return Ok(0) };
-  let prefix = format!("{}.", hash(path)?);
   let mut freed = 0;
   for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
-    if e.file_name().to_string_lossy().starts_with(&prefix) {
+    if e.file_name().to_string_lossy().starts_with(&format!("{key}.")) {
       freed += size(&e.path());
       if e.path().is_dir() { fs::remove_dir_all(e.path())? } else { fs::remove_file(e.path())? }
     }
   }
   Ok(freed)
+}
+
+/// Deletes the GGUF's compiled models; returns the bytes freed.
+pub fn unprepare(path: &Path) -> Result<u64> {
+  key(path)?.map_or(Ok(0), |key| remove(&key))
 }
 
 fn size(path: &Path) -> u64 {

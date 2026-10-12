@@ -34,7 +34,7 @@ use std::fmt;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
-use crate::{Error, Result};
+use crate::{Error, PrepareStep, Result};
 
 /// How many more times [`Hub::pull`] resumes a download that failed on the network, after 1, 2
 /// and 4 s.
@@ -160,6 +160,9 @@ pub struct Progress<'a> {
   /// The error a try failed with, on the one call before [`Hub::pull`] waits and retries;
   /// `None` on every other call.
   pub retrying: Option<&'a Error>,
+  /// The step of [preparing](crate::Model::prepare) the downloaded model for the Neural Engine,
+  /// once per step after the download (`done` equals `total` then); `None` while downloading.
+  pub preparing: Option<PrepareStep>,
 }
 
 /// A Hugging Face cache folder that holds models.
@@ -215,14 +218,19 @@ impl Hub {
   /// and returns the path of its file.
   ///
   /// It blocks until the file is complete: run it on a thread of your own. One HEAD request asks
-  /// the Hub for the latest revision; when the cache has it, nothing else is downloaded and
-  /// `progress` is never called. Otherwise the file downloads into
-  /// `blobs/<etag>.incomplete`, resuming a part an earlier pull left there, and moves into place
-  /// once complete. A download that breaks off is resumed up to [`RETRIES`] more times.
+  /// the Hub for the latest revision; when the cache has it, nothing else is downloaded.
+  /// Otherwise the file downloads into `blobs/<etag>.incomplete`, resuming a part an earlier pull
+  /// left there, and moves into place once complete. A download that breaks off is resumed up to
+  /// [`RETRIES`] more times.
+  ///
+  /// Then, for Parakeet and GigaAM on a Mac with a Neural Engine, it
+  /// [prepares](crate::Model::prepare) the file for it: 15–40 s the first time, under a second
+  /// once prepared. Elsewhere, and for the other families, this step is skipped.
   ///
   /// `progress` is called when the download starts, after every chunk it receives (often: throttle
-  /// your own UI updates), and before every retry. Return [`ControlFlow::Break`] to cancel: the
-  /// partial file stays for the next pull to resume.
+  /// your own UI updates), before every retry, and as each step of preparing starts
+  /// ([`Progress::preparing`]). Return [`ControlFlow::Break`] to cancel: a partial file stays for
+  /// the next pull to resume.
   ///
   /// # Errors
   ///
@@ -233,6 +241,8 @@ impl Hub {
   ///   wrong size.
   /// - [`Error::Cancelled`]: `progress` returned [`ControlFlow::Break`].
   /// - [`Error::Io`]: writing to the cache failed, for example on a full disk.
+  /// - [`Error::NeuralEngine`]: Core ML failed to prepare the downloaded file, which stays in the
+  ///   cache and runs on the GPU; the next pull tries again.
   ///
   /// # Examples
   ///
@@ -253,13 +263,19 @@ impl Hub {
   pub fn pull(
     &self,
     name: &str,
-    progress: impl FnMut(Progress<'_>) -> ControlFlow<()>,
+    mut progress: impl FnMut(Progress<'_>) -> ControlFlow<()>,
   ) -> Result<PathBuf> {
     let m = lookup(name)?;
-    self.pull_file(&m.repo(), &m.file(), progress)
+    let path = self.pull_file(&m.repo(), &m.file(), &mut progress)?;
+    let size = std::fs::metadata(&path)?.len();
+    crate::Model::prepare(&path, |step| {
+      progress(Progress { done: size, total: size, retrying: None, preparing: Some(step) })
+    })?;
+    Ok(path)
   }
 
-  /// Deletes a model by short or full name from the cache, and returns the bytes freed; `None`
+  /// Deletes a model by short or full name from the cache, along with what
+  /// [`Model::prepare`](crate::Model::prepare) made for it, and returns the bytes freed; `None`
   /// when it wasn't downloaded. Other files in the model's repository folder stay.
   ///
   /// Newer `hf` versions keep a file's bytes in a store shared across repositories,
@@ -274,7 +290,11 @@ impl Hub {
   /// - [`Error::Io`]: deleting failed.
   pub fn remove(&self, name: &str) -> Result<Option<u64>> {
     let m = lookup(name)?;
-    self.remove_file(&m.repo(), &m.file())
+    // Named by the file's content, which is gone once removed.
+    let prepared = self.find(name).map(|path| crate::ane::key(&path)).transpose()?.flatten();
+    let freed = self.remove_file(&m.repo(), &m.file())?;
+    let ane = prepared.map(|key| crate::ane::remove(&key)).transpose()?.unwrap_or(0);
+    Ok(freed.map(|bytes| bytes + ane))
   }
 }
 

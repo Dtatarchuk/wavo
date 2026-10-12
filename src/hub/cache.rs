@@ -83,7 +83,9 @@ impl Hub {
         match download(&remote.url, part, remote.size, &mut progress) {
           Err(e) if retry < RETRIES && transient(&e) => {
             let done = fs::metadata(part).map_or(0, |m| m.len());
-            if progress(Progress { done, total: remote.size, retrying: Some(&e) }).is_break() {
+            if progress(Progress { done, total: remote.size, retrying: Some(&e), preparing: None })
+              .is_break()
+            {
               return Err(Error::Cancelled);
             }
             std::thread::sleep(Duration::from_secs(1 << retry));
@@ -352,7 +354,7 @@ fn copy(
   let mut buf = vec![0; 1 << 16];
   let broke = |message| Error::Http { url: url.into(), status: None, message };
   loop {
-    if progress(Progress { done, total: size, retrying: None }).is_break() {
+    if progress(Progress { done, total: size, retrying: None, preparing: None }).is_break() {
       return Err(Error::Cancelled);
     }
     let n = match body.read(&mut buf) {

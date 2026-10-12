@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use indicatif::{MultiProgress, ProgressBar, ProgressFinish, ProgressStyle};
 use models::Source;
+use wavo::PrepareStep;
 use wavo::hub::{self, Hub, MODELS};
 
 const USAGE: &str = "\
@@ -236,7 +237,28 @@ fn pull_one(hub: &Hub, m: &hub::ModelInfo, bars: &MultiProgress) -> Result<PathB
     "{msg}: {percent:>3}% {decimal_bytes} / {decimal_total_bytes}, {decimal_bytes_per_sec}",
   )?;
   let (mut bar, mut retries): (Option<(ProgressBar, u64)>, u32) = (None, 0);
+  let mut spinner: Option<ProgressBar> = None;
   let path = hub.pull(m.name, |p| {
+    if let Some(step) = p.preparing {
+      let step = match step {
+        PrepareStep::Build => "building",
+        PrepareStep::Compile => "compiling",
+        _ => "loading, 10–30 s the first time",
+      };
+      let msg = format!("{}: preparing for the Neural Engine ({step})", m.name);
+      if plain {
+        eprintln!("{msg}");
+      } else {
+        let style = ProgressStyle::with_template("{spinner} {msg} {elapsed}").unwrap();
+        let new = || {
+          let s = bars.add(ProgressBar::new_spinner().with_style(style));
+          s.enable_steady_tick(Duration::from_millis(100));
+          s.with_finish(ProgressFinish::AndClear)
+        };
+        spinner.get_or_insert_with(new).set_message(msg);
+      }
+      return ControlFlow::Continue(());
+    }
     if let Some(e) = p.retrying {
       retries += 1;
       bar = None; // dropping a bar clears it
