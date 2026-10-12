@@ -3,7 +3,8 @@
 //! Each kernel has a portable version; a fast one (subgroups, cooperative matrices) replaces it
 //! when the device supports it and a probe dispatch of that pipeline succeeds.
 
-use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 
 use wgpu::BindGroup;
 pub use wgpu::Buffer;
@@ -34,8 +35,10 @@ pub struct Gpu {
   /// back the previous call's output; a slot without the number makes the call an error instead.
   marks: Buffer,
   marks_read: Buffer,
-  /// The last call's number. Calls share `marks`, so each holds this lock while it runs.
-  calls: Mutex<u32>,
+  /// The last call's number.
+  calls: AtomicU32,
+  /// Held from a call's first submission to its readback: calls share `marks`.
+  busy: Mutex<()>,
   /// The first device-lost or uncaptured wgpu error, reported by the next call.
   failure: Arc<Mutex<Option<String>>>,
 }
@@ -132,9 +135,11 @@ fn compile_fast(device: &wgpu::Device, f: usize) -> Option<FastPipelines> {
   (errors == 0).then_some((gemm, kernels))
 }
 
-/// Kernels for one decoder token: `gemv` and `embed` per weight type, `attend`, `combine` and
-/// `pack`.
+/// Kernels for one decoder token: `gemv` and `embed` per weight type, `attend`, `combine`, `pack`
+/// and, with the fast tier, a LayerNorm of one row. With the fast tier their reductions are
+/// subgroup.wgsl's.
 struct Decoder {
+  layer_norm: Option<Pipeline>,
   gemv: Vec<Pipeline>,
   embed: Vec<Pipeline>,
   attend: Pipeline,
@@ -297,7 +302,8 @@ impl Gpu {
       spare,
       marks,
       marks_read,
-      calls: Mutex::new(0),
+      calls: AtomicU32::new(0),
+      busy: Mutex::new(()),
       failure,
     };
     if let (Some(size), Some(compiled)) = (size, compiled) {
@@ -507,9 +513,18 @@ impl Gpu {
 
   fn decoder(&self) -> &Decoder {
     self.kernels.decoder.get_or_init(|| {
-      let (device, gemm) = (&self.device, &self.kernels.gemm_module);
-      let decode = module(device, include_str!("decode.wgsl"));
+      let device = &self.device;
+      let fast = self.fast.size != 0;
+      let source =
+        |s: &str| if fast { swap_fns(s, include_str!("subgroup.wgsl")) } else { s.into() };
+      let gemm = match fast {
+        true => &module(device, &source(include_str!("gemm.wgsl"))),
+        false => &self.kernels.gemm_module,
+      };
+      let decode = module(device, &source(include_str!("decode.wgsl")));
+      let ops = fast.then(|| module(device, &source(include_str!("ops.wgsl"))));
       Decoder {
+        layer_norm: ops.map(|ops| pipeline(device, &ops, "layer_norm", &[])),
         gemv: gemms(device, gemm, "gemv"),
         embed: gemms(device, gemm, "embed"),
         attend: pipeline(device, &decode, "attend", &[]),
@@ -574,9 +589,46 @@ impl Gpu {
     len: usize,
     record: impl FnOnce(&mut Pass),
   ) -> Result<Vec<f32>> {
-    let mut calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
-    *calls = calls.wrapping_add(1);
-    let call = *calls;
+    let busy = self.busy();
+    let r = self.record_call(groups, out, read, len, record);
+    self.complete(busy, r, read, || ())
+  }
+
+  /// `run` in two halves, so the CPU can record the next call while the GPU runs this one: records
+  /// a call, which must not use `Pass::layers`, for `finish`.
+  pub fn record(
+    &self,
+    groups: &mut Groups,
+    out: &Buffer,
+    read: &Buffer,
+    len: usize,
+    record: impl FnOnce(&mut Pass),
+  ) -> Recorded {
+    self.record_call(groups, out, read, len, |p| {
+      record(p);
+      assert!(p.queued.is_none(), "Gpu::record of a call with Pass::layers");
+    })
+  }
+
+  /// Submits a call from `record`, runs `meanwhile` while the GPU works, then waits for it and
+  /// returns its output, read through `read` (the buffer given to `record`).
+  pub fn finish(&self, r: Recorded, read: &Buffer, meanwhile: impl FnOnce()) -> Result<Vec<f32>> {
+    self.complete(self.busy(), r, read, meanwhile)
+  }
+
+  fn busy(&self) -> MutexGuard<'_, ()> {
+    self.busy.lock().unwrap_or_else(PoisonError::into_inner)
+  }
+
+  fn record_call(
+    &self,
+    groups: &mut Groups,
+    out: &Buffer,
+    read: &Buffer,
+    len: usize,
+    record: impl FnOnce(&mut Pass),
+  ) -> Recorded {
+    let call = self.calls.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     let mut p = Pass::new(self, groups, call);
     record(&mut p);
     p.mark(out);
@@ -585,7 +637,19 @@ impl Gpu {
     let (size, marks) = ((len * 4) as u64, marked as u64 * 4);
     encoder.copy_buffer_to_buffer(out, 0, read, 0, size);
     encoder.copy_buffer_to_buffer(&self.marks, 0, &self.marks_read, 0, marks);
-    self.queue.submit([encoder.finish()]);
+    Recorded { commands: encoder.finish(), call, size, marks }
+  }
+
+  fn complete(
+    &self,
+    _busy: MutexGuard<'_, ()>,
+    r: Recorded,
+    read: &Buffer,
+    meanwhile: impl FnOnce(),
+  ) -> Result<Vec<f32>> {
+    let Recorded { commands, call, size, marks } = r;
+    self.queue.submit([commands]);
+    meanwhile();
 
     let slices = [read.slice(..size), self.marks_read.slice(..marks)];
     let (tx, rx) = mpsc::channel();
@@ -610,6 +674,27 @@ impl Gpu {
     }
     Ok(data)
   }
+}
+
+/// A call recorded by `Gpu::record`, to run with `Gpu::finish`.
+pub struct Recorded {
+  commands: wgpu::CommandBuffer,
+  call: u32,
+  /// Bytes to read back: the output and the marks.
+  size: u64,
+  marks: u64,
+}
+
+/// `source` with each function of `fns` (WGSL) in place of the function of the same name.
+fn swap_fns(source: &str, fns: &str) -> String {
+  let mut out = source.to_string();
+  for f in fns.split("\nfn ").skip(1) {
+    let name = &f[..f.find('(').unwrap()];
+    let Some(start) = out.find(&format!("\nfn {name}(")) else { continue };
+    let end = start + out[start..].find("\n}").unwrap() + 2;
+    out.replace_range(start..end, &format!("\nfn {}", &f[..f.find("\n}").unwrap() + 2]));
+  }
+  out
 }
 
 fn fail(failure: &Mutex<Option<String>>, message: String) {
@@ -848,6 +933,17 @@ impl<'a> Pass<'a> {
     }
   }
 
+  /// LayerNorm of one row of `cols` from `x` into `y`: the decoder's, with subgroup sums on the
+  /// fast tier.
+  pub fn layer_norm_row(&mut self, x: &Buffer, n: &Channels, y: &Buffer, cols: usize) {
+    match &self.gpu.decoder().layer_norm {
+      Some(k) => {
+        self.run(k, &[x, &n.w, &n.b, y, x, &self.gpu.spare], &[1, cols as u32, 0], [1, 1, 1])
+      }
+      None => self.layer_norm(x, n, y, 1, cols, None),
+    }
+  }
+
   /// `c[offset..]` = `epilogue(a·Wᵀ + b)` for one row `a`, W not rounded to f16.
   pub fn gemv(&mut self, a: &Buffer, l: &Linear, c: &Buffer, epilogue: Epilogue, offset: usize) {
     let [mode, alpha] = epilogue.params();
@@ -856,16 +952,23 @@ impl<'a> Pass<'a> {
     self.run(&self.gpu.decoder().gemv[l.ty], &buffers, &params, [l.cols / 32, 1, 1]);
   }
 
-  /// `c` = row `id` of the table `l` + `pos[offset..]` + the table's bias, `l.k` values.
-  pub fn embed(&mut self, l: &Linear, pos: &Buffer, c: &Buffer, id: usize, offset: usize) {
-    let params = [id as u32, l.n as u32, l.k as u32, 0, 0, 0, offset as u32];
-    let buffers = [pos, &l.bias, c, &l.weight, l.scales.as_ref().unwrap_or(&l.bias)];
+  /// `c` = row `ids[i]` of the table `l` + `pos[offset..]` + the table's bias, `l.k` values. `ids`
+  /// holds token ids as u32 bits, so a step can be recorded before its token is known.
+  pub fn embed(
+    &mut self,
+    l: &Linear,
+    pos: &Buffer,
+    c: &Buffer,
+    (ids, i): (&Buffer, usize),
+    offset: usize,
+  ) {
+    let params = [i as u32, l.n as u32, l.k as u32, 0, 0, 0, offset as u32];
+    let buffers = [pos, &l.bias, c, &l.weight, l.scales.as_ref().unwrap_or(&l.bias), ids];
     self.run(&self.gpu.decoder().embed[l.ty], &buffers, &params, [l.k.div_ceil(256), 1, 1]);
   }
 
-  /// Attention of one query per head, `q` `[heads · head_dim]`, over keys 0..n of an F16 cache
-  /// into `o`, through `part` (`attend_len` floats). A cache row is K of all heads, then V, as f16
-  /// pairs.
+  /// Attention of one query per head, `q` `[heads · head_dim]`, over keys 0..n of an F16 cache of
+  /// `cols` positions (see `pack`) into `o`, through `part` (`attend_len` floats).
   #[allow(clippy::too_many_arguments)]
   pub fn attend(
     &mut self,
@@ -874,20 +977,35 @@ impl<'a> Pass<'a> {
     part: &Buffer,
     o: &Buffer,
     n: usize,
+    cols: usize,
     heads: usize,
     hd: usize,
   ) {
     let scale = (1.0 / (hd as f32).sqrt()).to_bits();
-    let params = [n as u32, hd as u32, scale, (heads * hd) as u32, (heads * hd / 2) as u32];
+    let params = [n as u32, hd as u32, scale, cols as u32];
     let k = self.gpu.decoder();
     self.run(&k.attend, &[q, kv, part], &params, [n.div_ceil(ATTEND_KEYS), heads, 1]);
     self.run(&k.combine, &[part, o], &params, [heads, 1, 1]);
   }
 
-  /// Packs `pairs` pairs of floats from `x[src..]` into f16 pairs at `y[dst..]`.
-  pub fn pack(&mut self, x: &Buffer, y: &Buffer, pairs: usize, src: usize, dst: usize) {
-    let params = [pairs as u32, 0, 0, 0, 0, src as u32, dst as u32];
-    self.run(&self.gpu.decoder().pack, &[x, y], &params, [pairs.div_ceil(256), 1, 1]);
+  /// Packs `rows` rows of `x` from float `src` on, `stride` floats apart, each K then V of `d`
+  /// floats, into the F16 cache `y` of `cols` positions at positions `col..`. The cache holds K
+  /// transposed (pair i of position j at word i·cols + j), then V by position (word d/2·cols +
+  /// j·d/2 + i).
+  #[allow(clippy::too_many_arguments)]
+  pub fn pack(
+    &mut self,
+    x: &Buffer,
+    [src, stride]: [usize; 2],
+    y: &Buffer,
+    rows: usize,
+    d: usize,
+    [cols, col]: [usize; 2],
+  ) {
+    let params = [rows, d, 0, cols, col, src, stride].map(|v| v as u32);
+    let size =
+      if rows == 1 { [d.div_ceil(256), 1, 1] } else { [rows.div_ceil(64), d.div_ceil(4), 1] };
+    self.run(&self.gpu.decoder().pack, &[x, y], &params, size);
   }
 
   /// Columns for a conv1d with `[kernel, stride, pad]` over `x` `[t][ch]`, rows of `ch · kernel`
@@ -1258,6 +1376,8 @@ mod tests {
       let (xb, rb) = (up(gpu, &x), up(gpu, &rope));
       let zeros = vec![0.0; rows * cols];
       assert_close(&run(gpu, &zeros, |p, y| p.layer_norm(&xb, &n, y, rows, cols, None)), &y);
+      let got = run(gpu, &zeros[..cols], |p, y| p.layer_norm_row(&xb, &n, y, cols));
+      assert_close(&got, &y[..cols]);
       let yb = gpu.buffer(rows * cols);
       let got =
         run(gpu, &zeros, |p, yr| p.layer_norm(&xb, &n, &yb, rows, cols, Some((&rb, yr, hd))));
@@ -1348,8 +1468,12 @@ mod tests {
             assert_close(&run(gpu, &c, |p, out| p.gemv(&ab, &l, out, e, 3)), &want);
           }
           let pb = up(gpu, &pos);
+          let ids = up(gpu, &[f32::from_bits(5), f32::from_bits(7)]);
           let want: Vec<f32> = (0..k).map(|i| w[7 * k + i] + pos[k + i] + bias[i]).collect();
-          assert_close(&run(gpu, &vec![0.0; k], |p, out| p.embed(&l, &pb, out, 7, k)), &want);
+          assert_close(
+            &run(gpu, &vec![0.0; k], |p, out| p.embed(&l, &pb, out, (&ids, 1), k)),
+            &want,
+          );
         }
       }
     }
@@ -1388,28 +1512,32 @@ mod tests {
             }
           }
           let got = run(gpu, &vec![0.0; d], |p, o| {
-            p.pack(&xb, &cache, keys * d, 0, 0);
-            p.attend(&qb, &cache, &part, o, n, heads, hd);
+            p.pack(&xb, [0, 2 * d], &cache, keys, d, [keys, 0]);
+            p.attend(&qb, &cache, &part, o, n, keys, heads, hd);
           });
           assert_close(&got, &want);
         }
       }
     }
-    let kv = random(40, 7);
+    // Rows of K then V (d = 6) from x[3..], 13 floats apart, into a cache of 7 positions; one row
+    // at position 4, or 2 rows at 5 and 6.
+    let x = random(3 + 13 * 2, 7);
+    let h = |x: f32| f16::from_f32(x).to_bits() as u32;
     for gpu in gpus() {
-      let xb = up(gpu, &kv);
-      // Pairs from x[3..] into y[5..].
-      let y = random(5 + 10, 9);
-      let got = run(gpu, &y, |p, out| p.pack(&xb, out, 10, 3, 5));
-      for (i, (g, y)) in got.iter().zip(&y).enumerate() {
-        let want = match i.checked_sub(5) {
-          Some(j) => {
-            let h = |x: f32| f16::from_f32(x).to_bits() as u32;
-            h(kv[3 + 2 * j]) | h(kv[4 + 2 * j]) << 16
+      let xb = up(gpu, &x);
+      for (rows, col) in [(1, 4), (2, 5)] {
+        let y = random(7 * 6, 9);
+        let got = run(gpu, &y, |p, out| p.pack(&xb, [3, 13], out, rows, 6, [7, col]));
+        let mut want: Vec<u32> = y.iter().map(|v| v.to_bits()).collect();
+        for j in 0..rows {
+          let pair = |i: usize| h(x[3 + 13 * j + 2 * i]) | h(x[4 + 13 * j + 2 * i]) << 16;
+          for i in 0..3 {
+            want[i * 7 + col + j] = pair(i);
+            want[3 * 7 + (col + j) * 3 + i] = pair(3 + i);
           }
-          None => y.to_bits(),
-        };
-        assert_eq!(g.to_bits(), want, "pack [{i}]");
+        }
+        let got: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(got, want, "pack {rows} rows");
       }
     }
   }

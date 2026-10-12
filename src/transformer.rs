@@ -157,7 +157,7 @@ struct Layer {
   fc2: Linear,
 }
 
-/// One token's activations and the caches. A cache row is K then V of all heads, as f16 pairs.
+/// One token's activations and the caches, F16 in `Pass::pack`'s layout.
 pub struct Steps {
   x: Buffer,
   y: Buffer,
@@ -235,19 +235,19 @@ impl Decoder {
   pub fn record_cross(&self, p: &mut Pass, b: &Steps, enc: &Buffer, scratch: &Buffer, t: usize) {
     for (l, cache) in self.layers.iter().zip(&b.cross) {
       p.gemm(enc, &l.cross_kv, scratch, t, Epilogue::Bias);
-      p.pack(scratch, cache, t * self.cfg.d, 0, 0);
+      p.pack(scratch, [0, 2 * self.cfg.d], cache, t, self.cfg.d, [t, 0]);
     }
   }
 
-  /// Records the decoder on `token` at position `pos`, attending to `frames` encoder frames; the
-  /// logits end up in `b.logits`. With rotary dims, `rope` is the table of `Pass::rope` from
-  /// position 0.
+  /// Records the decoder on a token at position `pos`, attending to `frames` encoder frames; the
+  /// logits end up in `b.logits`. The token is `ids[i]` (u32 bits) when the step runs. With
+  /// rotary dims, `rope` is the table of `Pass::rope` from position 0.
   #[allow(clippy::too_many_arguments)]
   pub fn record_step(
     &self,
     p: &mut Pass,
     b: &Steps,
-    token: usize,
+    token: (&Buffer, usize),
     pos: usize,
     frames: usize,
     rope: Option<&Buffer>,
@@ -256,20 +256,20 @@ impl Decoder {
     let at = if self.cfg.rot == 0 { pos * d } else { 0 };
     p.embed(&self.embed, &self.positions, &b.x, token, at);
     for (l, (own, cross)) in self.layers.iter().zip(b.own.iter().zip(&b.cross)) {
-      p.layer_norm(&b.x, &l.norm_self, &b.y, 1, d, None);
+      p.layer_norm_row(&b.x, &l.norm_self, &b.y, d);
       p.gemv(&b.y, &l.qkv, &b.qkv, Epilogue::Bias, 0);
       if let Some(table) = rope {
         p.rope(table, &b.qkv, 1, pos, [heads, hd, self.cfg.rot]);
       }
-      // k and v (2·d floats from d) into the cache row `pos`, d words.
-      p.pack(&b.qkv, own, d, d, pos * d);
-      p.attend(&b.qkv, own, &b.part, &b.att, pos + 1, heads, hd);
+      // k and v (2·d floats from d) into the cache at `pos`.
+      p.pack(&b.qkv, [d, 0], own, 1, d, [self.context, pos]);
+      p.attend(&b.qkv, own, &b.part, &b.att, pos + 1, self.context, heads, hd);
       p.gemv(&b.att, &l.self_out, &b.x, Epilogue::Residual(1.0), 0);
-      p.layer_norm(&b.x, &l.norm_cross, &b.y, 1, d, None);
+      p.layer_norm_row(&b.x, &l.norm_cross, &b.y, d);
       p.gemv(&b.y, &l.cross_q, &b.qkv, Epilogue::Bias, 0);
-      p.attend(&b.qkv, cross, &b.part, &b.att, frames, heads, hd);
+      p.attend(&b.qkv, cross, &b.part, &b.att, frames, frames, heads, hd);
       p.gemv(&b.att, &l.cross_out, &b.x, Epilogue::Residual(1.0), 0);
-      p.layer_norm(&b.x, &l.norm_ffn, &b.y, 1, d, None);
+      p.layer_norm_row(&b.x, &l.norm_ffn, &b.y, d);
       let act = if self.cfg.gated { Epilogue::Bias } else { Epilogue::Gelu };
       p.gemv(&b.y, &l.fc1, &b.h, act, 0);
       if self.cfg.gated {
@@ -277,7 +277,7 @@ impl Decoder {
       }
       p.gemv(&b.h, &l.fc2, &b.x, Epilogue::Residual(1.0), 0);
     }
-    p.layer_norm(&b.x, &self.norm, &b.y, 1, d, None);
+    p.layer_norm_row(&b.x, &self.norm, &b.y, d);
     p.gemv(&b.y, &self.embed, &b.logits, Epilogue::Bias, 0);
   }
 }

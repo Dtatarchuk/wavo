@@ -46,9 +46,10 @@ product goes out in blocks of 64 rows to four scoped threads that take the next 
 conv2 added onto the positions), pre-LN blocks with one `[q | k | v]` GEMM and flash attention, the
 cross `[K | V]` of every decoder layer packed into F16 caches, and the SOT step. Shapes are fixed
 (1500 frames, 448 positions), so the arena is allocated at load. The decoder runs on the GPU, one
-pass per token (gemv on Q8_0 rows, attention over the F16 self and cross caches, the tied head over
-the vocabulary), and reads the logits back; suppression, timestamp rules, argmax, language and
-no-speech run on the CPU, and windows advance as the reference's seek loop.
+pass per token (gemv on Q8_0 rows, attention over the F16 self and cross caches with K transposed,
+the tied head over the vocabulary), and reads the logits back; the next pass is recorded while the
+GPU runs one. Suppression, timestamp rules, argmax, language and no-speech run on the CPU, and
+windows advance as the reference's seek loop.
 
 **Moonshine.** No frontend: the whole input in one pass, with the arena and the rotary table
 (computed on the CPU) sized for the longest input so far. One submission (one per layer on the
@@ -85,7 +86,10 @@ Conformer families (31 ms per window, a third of the energy) is costed in [Other
 engines](plans/20261010-other-engines.md).
 
 Whisper, open in [the Whisper plan](plans/completed/20261010-whisper.md) (Task 6): decoder gemv bandwidth
-against ~100 GB/s, LayerNorm folded into the next gemv, the two prompt tokens as one two-row step.
+on Apple against ~100 GB/s, the two prompt tokens as one two-row step. On the RTX 4060 the decoder
+is at the memory's pace (see the 2026-10-12 profile): what is left there is ~25 small dispatches
+per token (LayerNorm, merge, pack: ~0.12 ms of ~1.03 ms on turbo when removed outright), which
+folding into the gemvs didn't save.
 
 GPUs without cooperative matrices, open in [the Linux plan](plans/20261010-linux.md) (Tasks 5
 and 7): profile the portable encoder with GPU timestamps; subgroup LayerNorm and conv_glu at any
@@ -96,8 +100,7 @@ approval, since it changes arithmetic, an int8 GEMM (`dot4I8Packed`) on Q8_0 act
 reference's CPU path does.
 
 GPUs with 16×16 F16 cooperative matrices ([plan](plans/completed/20261011-nvidia-fast.md)):
-Whisper's decoder on large models (gemv 140 + attend 65 ms on large-v3 `jfk`, the reference's
-whole decoder 249 ms); Parakeet's relative attention, still the portable scores, softmax and
+Parakeet's relative attention, still the portable scores, softmax and
 values (~58 of ~120 ms of kernels on V3 `dots`), as a flash kernel on 16×16 matrices or a portable
 one (which would help the N100 too); the GEMM under 16 workgroups (split-K or a 64-wide tile); the
 tier on AMD (a Radeon 610M's driver crashed, see the Log; RDNA3 and newer drivers untested) and
@@ -168,6 +171,15 @@ Each entry sits under its topic, newest first: date, model, what was tried, the 
 two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
+
+- 2026-10-12, GigaAM, Parakeet V3, Whisper turbo, encoder Q8_0 weights converted to F16 at load
+  (`f16(q·d)`, exact as the GEMM rounds dequantized W to f16; Whisper's decoder stays Q8_0;
+  timing-only ablation): fixtures exact. Warm on the M1 ru 71.7 → 69.1, ru-long 391 → 386, jfk 252.4
+  → 245.5, dots 645 → 642 ms, turbo jfk within noise; on the M2 ru 42.1 → 39.8, ru-long 248.3 →
+  247.2, jfk 147.4 → 138.9, dots 443 → 435, turbo jfk 1256 → 1229 ms. Load 47 → 77, 96 → 190, 110 →
+  220 ms; peak +167 / +474 / +564 MiB (292 → 459, 740 → 1212, 981 → 1545). Rejected: with a load per
+  recording, load plus a call is slower (GigaAM ru 89 → 117, Parakeet jfk 240 → 338 ms on the M2),
+  and writing twice the bytes at load keeps that true even with a faster conversion.
 
 - 2026-10-11, all models, Windows RTX 4060: the fast GEMM on 16×16 F16 cooperative matrices (F32
   accumulators), gemm_fast.wgsl written in F and built with F = 8 or 16 (at 16: 64 or 128 rows ×
@@ -424,6 +436,46 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### Whisper decoder
 
+- 2026-10-12, Whisper and Moonshine, the decoder's reductions on subgroups with the fast tier
+  (Apple, NVIDIA: `subgroupAdd` for the gemv's 32-lane sums, subgroup sums and maxima across the 8
+  subgroups of `attend`'s and the one-row LayerNorm's 256 threads; subgroup.wgsl's functions put
+  in place of the portable ones). A/B/A RTX 4060 turbo `jfk` 197.6 / 196.6 / 197.7, `ru-long`
+  456.0 / 451.9 / 456.2, large-v3 `jfk` 385.1 / 375.1 / 385.0 ms; M1 whisper-tiny `jfk` 118.4 /
+  113.0 / 117.9, Moonshine tiny `dots` 418.5 / 380.7 / 408.1, turbo `jfk` 1766 / 1754 / 1766 ms;
+  N100 (portable, unchanged kernels) `jfk` 734 / 736 / 735, `dots` 1863 / 1869 / 1863 ms. Fixtures
+  exact. Kept. Of the large-v3 gain the gemv alone gave 384 → 377, `attend` and LayerNorm the rest.
+  - The fast LayerNorm (one subgroup per row) for the decoder's rows on the RTX 4060: a step 1.066
+    → 1.186 ms on turbo `ru-long`. Rejected.
+- 2026-10-12, Whisper and Moonshine, LayerNorm and the merge of `attend`'s parts computed by every
+  workgroup of the gemv after them (a prologue into 5 KB of shared memory, the same arithmetic;
+  21 dispatches less per turbo token). RTX 4060 A/B/A turbo `jfk` 197.3 / 197.4 / 197.6, `ru-long`
+  455.5 / 457.8 / 456.0, large-v3 `jfk` 383.6 / 386.4 / 384.0 ms; M2 whisper-tiny `jfk` 63.9 / 67.5
+  / 63.4, Moonshine tiny `dots` 225.5 / 239.1 / 228.2 ms. Each gemv's prologue (two 256-thread
+  sums before its first weight load, in each of the head's 1622 workgroups) cost what the dispatch
+  had: head 274 → 280 µs, fc1 32 → 37, the merging gemvs 11 → 14. Rejected.
+  - Upper bound, timing only: the 25 LayerNorm, merge and pack dispatches of a turbo token
+    removed outright, 1.097 → 0.973 ms per step.
+- 2026-10-12, Whisper, the next step recorded while the GPU runs one (`Gpu::record` and
+  `finish`; the token comes from a buffer written before the submit). On the RTX 4060 recording a
+  step took ~0.1 ms of its ~1.2 with the GPU idle. A/B/A turbo `jfk` 199.2 / 196.5 / 199.6,
+  `ru-long` 464.3 / 455.7 / 465.7 ms; M2 whisper-tiny `jfk` 65.3 / 64.5 / 64.4 ms (noise); N100
+  whisper-tiny `jfk` 747 / 735 / 747, `dots` 1943 / 1865 / 1943 ms. Fixtures exact. Kept.
+- 2026-10-12, Whisper and Moonshine, the decoder caches with K transposed (pair i of position j
+  at word i·cols + j; V stays by position), so `attend`'s threads, one key each, read consecutive
+  words; the cross cache is packed in runs of 64 positions. RTX 4060 (turbo, GPU timestamps):
+  cross `attend` 48 → 35 µs per layer and token, its pack 39 → 116 µs per layer and window.
+  A/B/A turbo `jfk` 200.3 / 199.2 / 200.6, `ru-long` 470.5 / 465.5 / 470.8 ms; M2 whisper-tiny
+  `jfk` 67.5 / 65.0 / 67.1, Moonshine tiny `dots` 238.2 / 226.0 / 238.4, turbo `jfk` 1242 / 1247
+  / 1241 ms (noise); N100 whisper-tiny `jfk` 758 / 749 / 759, `dots` 1992 / 1945 / 1990 ms.
+  Fixtures exact. Kept.
+  - Ablations before it (RTX 4060, timing only): cross `attend` 48 µs, 24 without the K reads,
+    8.5 without K and V. V ran at ~256 GB/s, K (128-byte runs 5 KB apart, a run per thread) at
+    ~160. 16-byte K loads per thread on the old layout: 49 µs, no gain.
+- 2026-10-12, Whisper, gemv with one 16-byte vector of W per thread and row, 1, 2 or 4 rows per
+  32 threads (RTX 4060, turbo, GPU timestamps): every shape within ±3% of the kept kernel
+  (1280×1280 10.8 → 10.9–11.4 µs, 5120×1280 32.4 → 30.8–32.3, 1280×5120 31.3 → 31.0–33.4, the
+  head 274 → 273–275). The head already streams at ~258 GB/s of the 272 peak, the layers at
+  ~200–225 (dispatch ramp and tail). Rejected.
 - 2026-10-10, Whisper, decoder gemv over 4 rows per 32 threads: jfk 1603 → 1563 ms. Kept.
 
 ### Frontend and FFT
@@ -539,6 +591,15 @@ plus first call.
 ### Benchmarks and profiles
 
 Numbers are in the plans' "## Result" sections.
+
+- 2026-10-12, Whisper turbo decoder on the RTX 4060, `ru-long` (117 steps), after the decoder
+  entries of that day (GPU timestamps, each dispatch in its own pass): per token the gemvs 0.74
+  ms (168 MB of Q8_0 at ~228 GB/s of the 272 peak; the head alone ~258), cross `attend` 0.14,
+  LayerNorm 0.06, self `attend`, merge, pack, embed and mark 0.07; a step 1.03 ms wall, the next
+  one recorded meanwhile. The reference's decoder (Vulkan) on the same clip: ~162 ms (`decode_ms`
+  324 less the second window's encoder, ~162) against wavo's ~128 (steps 120.5, cross K/V and
+  the two SOT steps ~7.5). Warm: `jfk` 196.6 vs 226, `ru-long` 451.9 vs 503, large-v3 `jfk`
+  375 vs 427 ms.
 
 - 2026-10-11, Parakeet V3 and Whisper turbo against Neural Engine engines: FluidAudio (ANE) is
   2.2–2.3× faster than wavo on 11–35 s at a third of the energy; WhisperKit (ANE) is 1.4–1.8×
