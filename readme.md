@@ -37,8 +37,11 @@ ollama-like model manager, or as a library that builds with a plain `cargo build
 wavo is written by AI agents (Claude Code, Codex) following [agents.md](agents.md); I choose what
 to build and review every pull request. Each model's output is checked against transcribe.cpp's
 own ([fixtures](tests/fixtures/)), and every speed change is measured and logged in
-[docs/perf.md](docs/perf.md). Hand-written projects of mine: [macmon](https://github.com/vladkens/macmon),
-[twscrape](https://github.com/vladkens/twscrape).
+[docs/perf.md](docs/perf.md). This isn't a weekend prompt: I've written software by hand for years
+— [macmon](https://github.com/vladkens/macmon) (Rust, Apple Silicon system monitor),
+[twscrape](https://github.com/vladkens/twscrape) (Python, X/Twitter scraping) and
+[ecloop](https://github.com/vladkens/ecloop) (C, low-level elliptic-curve math) — and agents are
+how I build now.
 
 ## 🧠 Models
 
@@ -178,6 +181,18 @@ Whisper's other sizes and Moonshine are faster too
 ([Whisper plan](docs/plans/completed/20261010-whisper.md),
 [Moonshine plan](docs/plans/20261011-moonshine.md)).
 
+**Apple M5** (10-core GPU, macOS 27.0.1) against transcribe.cpp on Metal, 2026-10-12, wavo at
+[#43]. On the M5 both multiply on the GPU's neural accelerators through the Metal 4 tensor API.
+Clips: `jfk` 11 s, `ru` 4.5 s, `ru-long` 34 s, `dots` 35 s.
+
+| Model | Clip | wavo, ms | transcribe.cpp, ms |
+|---|---|---|---|
+| `gigaam-v3` | `ru` / `ru-long` | **17.3 / 87** | 20.7 / 120 |
+| `parakeet-v3` | `jfk` / `dots` | **60 / 185** | 94 / 313 |
+| `whisper-turbo` | `jfk` | **420** | 573 |
+| `moonshine-tiny` | `jfk` | **20.3** | 70 |
+| `moonshine-base` | `jfk` | **30.9** | 120 |
+
 **NVIDIA RTX 4060 Laptop** (Windows 11, Vulkan) against transcribe.cpp's Vulkan build, 2026-10-11
 and 12. wavo at 7aa51e6 ([#38]) for `whisper-turbo`, `whisper-small`, `whisper-medium` and
 `whisper-large-v3`, a397b48 ([#36]) for the other models, and 4973122 for Parakeet, which #36 left
@@ -205,6 +220,7 @@ plan](docs/plans/20261012-speed.md).
 [#24]: https://github.com/vladkens/wavo/pull/24
 [#36]: https://github.com/vladkens/wavo/pull/36
 [#38]: https://github.com/vladkens/wavo/pull/38
+[#43]: https://github.com/vladkens/wavo/pull/43
 
 ## 📚 Library usage
 
