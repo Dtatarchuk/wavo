@@ -735,9 +735,11 @@ mod tests {
           from = v.trim().trim_end_matches('-').parse().unwrap();
         }
       }
-      let (status, part) = if range { ("206 Partial Content", &body[from..]) } else { ("200 OK", body) };
+      let (status, part) =
+        if range { ("206 Partial Content", &body[from..]) } else { ("200 OK", body) };
       let mut out = stream;
-      let head = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", part.len());
+      let head =
+        format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", part.len());
       out.write_all(head.as_bytes()).unwrap();
       out.write_all(part).unwrap();
     });
@@ -752,13 +754,14 @@ mod tests {
     let body: &[u8] = b"hello, world";
     let mut go = |range| {
       fs::write(&part, b"hello").unwrap();
-      download(&serve_once(body, range), &part, body.len() as u64, &mut |_| ControlFlow::Continue(()))
-        .unwrap();
+      download(&serve_once(body, range), &part, body.len() as u64, &mut |_| {
+        ControlFlow::Continue(())
+      })
+      .unwrap();
       assert_eq!(fs::read(&part).unwrap(), body, "range: {range}");
     };
     go(true); // 206: continues after the 5 bytes already there
     go(false); // 200: the server ignored Range, so the part starts over
     fs::remove_dir_all(&hub.root).unwrap();
   }
-
 }
