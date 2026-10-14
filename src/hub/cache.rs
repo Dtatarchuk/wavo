@@ -752,7 +752,7 @@ mod tests {
     fs::create_dir_all(&hub.root).unwrap();
     let part = hub.root.join("f.incomplete");
     let body: &[u8] = b"hello, world";
-    let mut go = |range| {
+    let go = |range| {
       fs::write(&part, b"hello").unwrap();
       download(&serve_once(body, range), &part, body.len() as u64, &mut |_| {
         ControlFlow::Continue(())
