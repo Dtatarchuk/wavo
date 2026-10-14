@@ -37,7 +37,8 @@ joint weights; CTC is an argmax and collapse per frame.
 **Parakeet.** The shared Conformer block (`src/conformer.rs`) with relative attention: one GEMM for
 `[q | k | v]` whose epilogue writes `[q + u | k | v | q + v]`, `P = linear_pos(pos_emb)` per block,
 then flash attention that scores each 16-query × 64-key block against the 80 positions it needs
-and skews them onto the keys in shared memory. The sinusoidal table is cached on the CPU for the
+and skews them onto the keys in shared memory (Apple), or the portable flash kernel, which reads
+the 63 position rows of a 32 × 32 block and indexes each score's row directly. The sinusoidal table is cached on the CPU for the
 longest T so far; its 2T + 15 rows are written per call. Subsampling runs in 8 chunks of output
 rows, with conv0 + ReLU fused into the first depthwise conv and the pointwise convs through the
 GEMM; BatchNorm is folded into a per-channel affine at load. The TDT loop and two LSTM layers run
@@ -96,13 +97,12 @@ is at the memory's pace (see the 2026-10-12 profile): what is left there is ~25 
 per token (LayerNorm, merge, pack: ~0.12 ms of ~1.03 ms on turbo when removed outright), which
 folding into the gemvs didn't save.
 
-GPUs without cooperative matrices, open in [the Linux plan](plans/20261010-linux.md) (Tasks 5
-and 7): profile the portable encoder with GPU timestamps; subgroup LayerNorm and conv_glu at any
-subgroup width, apart from the cooperative-matrix gate; a register-tiled GEMM with Q8_0/F16
-dequantized in registers (optionally F16 math);
-Parakeet's fixed cost per call (`first_depthwise`, frames padded to 64); with the person's
-approval, since it changes arithmetic, an int8 GEMM (`dot4I8Packed`) on Q8_0 activations as the
-reference's CPU path does.
+GPUs without cooperative matrices, open in [the Linux plan](plans/20261010-linux.md) (Tasks 5 and
+7): the portable GEMM is ~90% of Parakeet's GPU time on the N100 (~120 GFLOP/s of its ~290 peak in
+FFN up); F16 math in it; subgroup LayerNorm and conv_glu at any subgroup width, apart from the
+cooperative-matrix gate; Parakeet's fixed cost per call (`first_depthwise`, frames padded to 64);
+with the person's approval, since it changes arithmetic, an int8 GEMM (`dot4I8Packed`) on Q8_0
+activations as the reference's CPU path does.
 
 Apple M5: the GEMM's inputs written as f16 by their producers (LayerNorm, attention, conv_glu,
 the GEMM epilogue, im2col) instead of the `cast` pass, which costs 2–5% of a call (see the Log);
@@ -110,9 +110,8 @@ F16 weights read from device memory without staging; flash attention on the tens
 keeps it off there).
 
 GPUs with 16×16 F16 cooperative matrices ([plan](plans/completed/20261011-nvidia-fast.md)):
-Parakeet's relative attention, still the portable scores, softmax and
-values (~58 of ~120 ms of kernels on V3 `dots`), as a flash kernel on 16×16 matrices or a portable
-one (which would help the N100 too); the GEMM under 16 workgroups (split-K or a 64-wide tile); the
+Parakeet's relative attention as a flash kernel on 16×16 matrices (the portable flash kernel took
+it from ~58 ms of kernels on V3 `dots`, see the Log); the GEMM under 16 workgroups (split-K or a 64-wide tile); the
 tier on AMD (a Radeon 610M's driver crashed, see the Log; RDNA3 and newer drivers untested) and
 Intel Arc.
 
@@ -185,6 +184,33 @@ Each entry sits under its topic, newest first: date, model, what was tried, the 
 two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
+
+- 2026-10-12, all models, the portable GEMM (all GEMMs on GPUs without cooperative matrices, and
+  those under 16 tiles of the 16×16 GEMM on NVIDIA): tiles of ROWS × 128 (64 rows; 32 on the
+  16×16 tier, for more workgroups), each of 256 threads on 4 (2) rows × two column quads, a
+  staged as [row][k quad] quads (16-byte loads) and W transposed to [k][column quad], so a step of
+  4 k takes 4 (2) a loads and 8 W loads for 32 (16) vector FMAs; the next K step's a and W words
+  are loaded before this step's products. Each output sums k in the same order: fixtures exact
+  (N100, RTX 4060, M2). N100 A/B/A (main / this / main, with the relative attention above):
+  Parakeet V3 `jfk` 3508 / 2199 / 3492, `dots` 11690 / 5702 / 11688, GigaAM `ru` 755 / 524 / 755,
+  `ru-long` 5627 / 4170 / 5624, whisper-tiny `jfk` 736 / 649 / 736, `dots` 1868 / 1696 / 1870,
+  Moonshine `dots` tiny 1531 / 1452 / 1531, base 2757 / 2531 / 2758, whisper-turbo `jfk` 30110 /
+  23224 / 30116 ms. RTX 4060: GigaAM `ru` 19.1 / 16.9 / 18.7 ms, the rest within noise or faster
+  through the attention. Kept.
+  - Steps on the N100 (GPU timestamps, Parakeet V3 `dots`, FFN up 4096←1024 per dispatch): the
+    old 64×64 tile 43.9 ms; 64×128 tiles with per-k scalar a loads 42.7 (F16 layers 25.6 → 22.1).
+    Ablations of that one: W not rounded to f16 41.9, W not loaded or dequantized 41.6, the inner
+    loop over 1 of 32 k 13.9 ms: the loop's shared-memory loads were the limit. a as quads with 4 k
+    per step: 30.5 ms, `dots` 7710 → 5753 ms. Kept.
+  - Loads of the next K step before the products: N100 `dots` 5753 → 5848, `jfk` 2168 → 2206 ms
+    (+1.5–2%), but on the RTX 4060 it made 32-row tiles beat the old kernel: GigaAM `ru` 21.0 →
+    17.5 ms (old 19.0). Kept, one kernel for both.
+  - 32-row tiles under 16 workgroups everywhere: N100 GigaAM `ru` 518 → 615 ms. Only on the
+    16×16 tier.
+  - 8 rows × 8 columns per thread (128 threads): N100 FFN up 96.6 ms, 3× slower (register spills
+    under Mesa). Rejected.
+  - 64×64 tiles with the quad loop (4 × 4 per thread): N100 `dots` 7378 vs 5641, GigaAM `ru` 705
+    vs 518 ms; RTX 4060 `ru` 20.6 vs 18.7 (old). Rejected.
 
 - 2026-10-12, all models, Apple M5 (10 GPU cores, macOS 27.0.1): the GEMM on the Metal 4 tensor
   API (MetalPerformancePrimitives' `matmul2d`, after ggml's tensor `kernel_mul_mm`) through
@@ -289,6 +315,16 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### Attention
 
+- 2026-10-12, Parakeet V2 and V3, portable flash attention with relative positions (head_dim ≤
+  128, a multiple of 4) instead of the scores, softmax and values kernels: the flash kernel's
+  layout (32 queries × 32 keys, 128 threads, each on 2 queries × 4 keys), with q + u, q + v, k and
+  the block's 63 position rows staged in chunks of 32 columns (25 KB of shared memory); a thread
+  reads the 6 consecutive rows its 8 scores need, so the skew is in the indexing and no score
+  matrix exists. v is staged in two halves of 64 columns. N100 (GPU timestamps, `dots`):
+  attention 4291 → 427 ms per call (the old `scores` alone 3797: 128-long dots of q + v with
+  position rows read from memory per score). A/B/A N100 `jfk` 3498 / 3118 / 3502, `dots` 11695 /
+  7841 / 11699 ms (reference Vulkan 3271 / 8830); RTX 4060 `dots` 229.2 / 182.3 / 230.0 ms.
+  Fixtures exact (N100, M2; Apple keeps its 8×8 kernel). Kept.
 - 2026-10-12, Moonshine, M2: Apple's 8×8 flash kernel for heads of a multiple of 4 (36, 52)
   instead of the portable one: a last fragment of 4 columns takes q from a zero-padded copy in
   shared memory (k's extra columns then add zeros), reads 4 floats past each v row and writes

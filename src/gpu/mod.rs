@@ -50,10 +50,14 @@ pub struct Gpu {
 struct Kernels {
   /// One per weight type.
   gemm: Vec<Pipeline>,
+  /// Rows of the GEMM's tile: 32 on the 16×16 tier, whose GEMMs that come here are too small
+  /// for its tiles and run faster with more workgroups, else 64.
+  gemm_rows: usize,
   layer_norm: Pipeline,
   im2col: Pipeline,
   conv_glu: Pipeline,
   flash: Pipeline,
+  relative: Pipeline,
   scores: Pipeline,
   softmax: Pipeline,
   values: Pipeline,
@@ -71,17 +75,24 @@ struct Kernels {
 }
 
 impl Kernels {
-  fn new(device: &wgpu::Device) -> Self {
+  fn new(device: &wgpu::Device, gemm_rows: usize) -> Self {
     let gemm = module(device, include_str!("gemm.wgsl"));
     let ops = module(device, include_str!("ops.wgsl"));
     let attention = module(device, include_str!("attention.wgsl"));
     let spatial = module(device, include_str!("spatial.wgsl"));
     Self {
-      gemm: gemms(device, &gemm, "gemm"),
+      gemm: (0..3)
+        .map(|ty| {
+          let constants = [("WTYPE", ty as f64), ("ROWS", gemm_rows as f64)];
+          pipeline(device, &gemm, "gemm", &constants)
+        })
+        .collect(),
+      gemm_rows,
       layer_norm: pipeline(device, &ops, "layer_norm", &[]),
       im2col: pipeline(device, &ops, "im2col", &[]),
       conv_glu: pipeline(device, &ops, "conv_glu", &[]),
       flash: pipeline(device, &attention, "flash", &[]),
+      relative: pipeline(device, &attention, "relative", &[]),
       scores: pipeline(device, &attention, "scores", &[]),
       softmax: pipeline(device, &ops, "softmax", &[]),
       values: pipeline(device, &attention, "values", &[]),
@@ -295,7 +306,8 @@ impl Gpu {
         let fast = size.and_then(|f| compile_fast(&device, f));
         (fast, if tensor { compile_tensor(&device) } else { None })
       });
-      (Kernels::new(&device), compiled.join().unwrap())
+      let rows = if size == Some(16) { 32 } else { 64 };
+      (Kernels::new(&device, rows), compiled.join().unwrap())
     });
     let weights = wgpu::BufferUsages::STORAGE
       | if mappable { wgpu::BufferUsages::MAP_WRITE } else { wgpu::BufferUsages::COPY_DST };
@@ -639,7 +651,7 @@ impl Gpu {
 
   /// Whether the portable path has a flash kernel for heads of `head_dim`.
   fn portable_flash(head_dim: usize, relative: bool) -> bool {
-    !relative && head_dim <= 64 && head_dim.is_multiple_of(4)
+    head_dim <= if relative { 128 } else { 64 } && head_dim.is_multiple_of(4)
   }
 
   /// Floats of attention scratch for `t` frames: the portable path without flash attention keeps
@@ -1091,7 +1103,10 @@ impl<'a> Pass<'a> {
           [l.n.div_ceil(8 * f), m.div_ceil(rows), 1],
         )
       }
-      _ => self.run(&gpu.kernels.gemm[l.ty], &buffers, &params, [l.n / 64, m.div_ceil(64), 1]),
+      _ => {
+        let size = [l.n.div_ceil(128), m.div_ceil(gpu.kernels.gemm_rows), 1];
+        self.run(&gpu.kernels.gemm[l.ty], &buffers, &params, size)
+      }
     }
   }
 
@@ -1262,7 +1277,8 @@ impl<'a> Pass<'a> {
     }
     let (k, tiles) = (&self.gpu.kernels, t.div_ceil(16));
     if Gpu::portable_flash(head_dim, d == 1) {
-      return self.run(&k.flash, &[qk, v, o], &params[..7], [t.div_ceil(32), heads, 1]);
+      let (k, buffers) = if d == 1 { (&k.relative, [qk, pos, o]) } else { (&k.flash, [qk, v, o]) };
+      return self.run(k, &buffers, &params[..7], [t.div_ceil(32), heads, 1]);
     }
     self.run(&k.scores, &[qk, pos, s], &params, [tiles, tiles, heads]);
     self.run(&k.softmax, &[s], &params[..1], [t, heads, 1]);
