@@ -85,10 +85,21 @@ fn read_fixture(name: &str, sample: &str) -> (String, Option<Vec<(String, u32)>>
   (text.to_string(), Some(tokens), segments)
 }
 
+/// The GGUF's `general.languages` is the model's `language_codes` in `hub::MODELS`.
+#[cfg(feature = "hub")]
+fn check_languages(name: &str, path: &Path) {
+  let g = gguf::Gguf::open(path).unwrap();
+  let codes: Vec<&str> = g.array("general.languages").unwrap();
+  assert_eq!(codes, wavo::hub::lookup(name).unwrap().language_codes, "{name}: general.languages");
+}
+
 fn check(name: &str, samples: &[&str]) {
   let _gpu = GPU.lock().unwrap_or_else(PoisonError::into_inner);
   let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-  let model = wavo::Model::load(model_path(name)).unwrap();
+  let path = model_path(name);
+  #[cfg(feature = "hub")]
+  check_languages(name, &path);
+  let model = wavo::Model::load(&path).unwrap();
   for sample in samples {
     let pcm = read_wav(&root.join(format!("3rd/transcribe.cpp/samples/{sample}.wav")));
     let (text, tokens, segments) = read_fixture(name, sample);
@@ -115,17 +126,6 @@ fn check(name: &str, samples: &[&str]) {
       got = joined.into_iter().map(|(text, start)| (trim(text), start)).collect();
     }
     assert_eq!(got, tokens, "{name} {sample}: tokens");
-  }
-}
-
-/// Every model's `general.languages` is its `language_codes` in `hub::MODELS`.
-#[cfg(feature = "hub")]
-#[test]
-fn language_codes() {
-  for m in wavo::hub::MODELS {
-    let g = gguf::Gguf::open(&model_path(m.full_name)).unwrap();
-    let codes: Vec<&str> = g.array("general.languages").unwrap();
-    assert_eq!(codes, m.language_codes, "{}", m.full_name);
   }
 }
 
