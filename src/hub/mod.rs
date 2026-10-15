@@ -55,7 +55,9 @@ pub struct ModelInfo {
   pub languages: &'static str,
   /// The languages it transcribes, for programs: the codes its GGUF lists in `general.languages`,
   /// in that order. They are short BCP-47 codes, ISO 639-1 where one exists (`en`, `ru`), else
-  /// ISO 639-3 (`haw`, `yue`); Whisper's lists keep its own `jw` for Javanese (ISO `jv`).
+  /// ISO 639-3 (`haw`, `yue`); Whisper's lists keep its own `jw` for Javanese (ISO `jv`). A
+  /// fine-tune can list its base model's languages: Breeze-ASR-25, tuned for Taiwanese Mandarin
+  /// and English, lists Whisper's 99.
   ///
   /// # Examples
   ///
@@ -113,7 +115,6 @@ static WHISPER_V3: &[&str] = &[
   "sr", "su", "sv", "sw", "ta", "te", "tg", "th", "tk", "tl", "tr", "tt", "uk", "ur", "uz", "vi",
   "yi", "yo", "yue", "zh",
 ];
-static BREEZE: &[&str] = &["zh", "en"];
 
 /// Every model wavo can download by name, as in the crate's [model table](crate#models).
 #[rustfmt::skip]
@@ -136,7 +137,7 @@ pub static MODELS: &[ModelInfo] = &[
   ModelInfo { name: "whisper-medium.en", full_name: "whisper-medium.en", size: 831_460_928, languages: "English", language_codes: EN, punctuated: true },
   ModelInfo { name: "whisper-large", full_name: "whisper-large", size: 1_667_964_192, languages: "99 languages", language_codes: WHISPER, punctuated: true },
   ModelInfo { name: "whisper-large-v2", full_name: "whisper-large-v2", size: 1_667_964_224, languages: "99 languages", language_codes: WHISPER, punctuated: true },
-  ModelInfo { name: "breeze-asr-25", full_name: "Breeze-ASR-25", size: 1_667_964_224, languages: "Taiwanese Mandarin and English", language_codes: BREEZE, punctuated: true },
+  ModelInfo { name: "breeze-asr-25", full_name: "Breeze-ASR-25", size: 1_667_964_224, languages: "Taiwanese Mandarin and English", language_codes: WHISPER, punctuated: true },
   ModelInfo { name: "moonshine-tiny", full_name: "moonshine-tiny", size: 35_466_912, languages: "English", language_codes: EN, punctuated: true },
   ModelInfo { name: "moonshine-base", full_name: "moonshine-base", size: 77_476_480, languages: "English", language_codes: EN, punctuated: true },
 ];
