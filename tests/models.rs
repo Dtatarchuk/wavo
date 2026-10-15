@@ -1,10 +1,28 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
 //! Transcripts must match the reference fixtures (`make fixtures`) exactly: text, every token piece
-//! and its start time (for Whisper every segment's text and start). Missing models or samples fail
-//! the test.
+//! and its start time (for Whisper every segment's text and start). Every GGUF must list the
+//! languages `hub::MODELS` gives its model. Missing models or samples fail the test.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
+
+/// The library's GGUF reader, to read metadata the API doesn't expose. It fails through `error`.
+#[cfg(feature = "hub")]
+#[path = "../src/gguf.rs"]
+#[allow(dead_code)]
+mod gguf;
+
+#[cfg(feature = "hub")]
+mod error {
+  pub use wavo::Result;
+
+  macro_rules! bail {
+    ($($arg:tt)*) => {
+      return Err(wavo::Error::Model(format!($($arg)*)))
+    };
+  }
+  pub(crate) use bail;
+}
 
 /// One model at a time: they share the GPU anyway, and several large ones at once overrun the
 /// memory of an 8 GB card.
@@ -97,6 +115,17 @@ fn check(name: &str, samples: &[&str]) {
       got = joined.into_iter().map(|(text, start)| (trim(text), start)).collect();
     }
     assert_eq!(got, tokens, "{name} {sample}: tokens");
+  }
+}
+
+/// Every model's `general.languages` is its `language_codes` in `hub::MODELS`.
+#[cfg(feature = "hub")]
+#[test]
+fn language_codes() {
+  for m in wavo::hub::MODELS {
+    let g = gguf::Gguf::open(&model_path(m.full_name)).unwrap();
+    let codes: Vec<&str> = g.array("general.languages").unwrap();
+    assert_eq!(codes, m.language_codes, "{}", m.full_name);
   }
 }
 
