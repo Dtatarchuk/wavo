@@ -65,13 +65,13 @@ pub struct ModelInfo {
   ///
   /// ```
   /// let ru: Vec<&str> = (wavo::hub::MODELS.iter())
-  ///   .filter(|m| m.language_codes.contains(&"ru"))
+  ///   .filter(|m| m.langs.contains(&"ru"))
   ///   .map(|m| m.name)
   ///   .collect();
   /// assert!(ru.contains(&"gigaam-v3") && ru.contains(&"parakeet-v3"));
   /// assert!(!ru.contains(&"parakeet-v2"));
   /// ```
-  pub language_codes: &'static [&'static str],
+  pub langs: &'static [&'static str],
   /// Whether the text comes cased and punctuated; `false` is lowercase without punctuation.
   pub punctuated: bool,
 }
@@ -119,27 +119,27 @@ static WHISPER_V3: &[&str] = &[
 /// Every model wavo can download by name, as in the crate's [model table](crate#models).
 #[rustfmt::skip]
 pub static MODELS: &[ModelInfo] = &[
-  ModelInfo { name: "parakeet-v3", full_name: "parakeet-tdt-0.6b-v3", size: 739_508_576, languages: "25 European languages", language_codes: PARAKEET_V3, punctuated: true },
-  ModelInfo { name: "parakeet-v2", full_name: "parakeet-tdt-0.6b-v2", size: 729_574_912, languages: "English", language_codes: EN, punctuated: true },
-  ModelInfo { name: "gigaam-v3", full_name: "gigaam-v3-e2e-rnnt", size: 273_724_832, languages: "Russian", language_codes: RU, punctuated: true },
-  ModelInfo { name: "gigaam-v3-e2e-ctc", full_name: "gigaam-v3-e2e-ctc", size: 272_151_136, languages: "Russian", language_codes: RU, punctuated: true },
-  ModelInfo { name: "gigaam-v3-rnnt", full_name: "gigaam-v3-rnnt", size: 273_022_880, languages: "Russian", language_codes: RU, punctuated: false },
-  ModelInfo { name: "gigaam-v3-ctc", full_name: "gigaam-v3-ctc", size: 271_803_328, languages: "Russian", language_codes: RU, punctuated: false },
-  ModelInfo { name: "whisper-turbo", full_name: "whisper-large-v3-turbo", size: 886_381_760, languages: "100 languages", language_codes: WHISPER_V3, punctuated: true },
-  ModelInfo { name: "whisper-tiny", full_name: "whisper-tiny", size: 45_981_088, languages: "99 languages", language_codes: WHISPER, punctuated: true },
-  ModelInfo { name: "whisper-base", full_name: "whisper-base", size: 84_962_880, languages: "99 languages", language_codes: WHISPER, punctuated: true },
-  ModelInfo { name: "whisper-small", full_name: "whisper-small", size: 269_751_136, languages: "99 languages", language_codes: WHISPER, punctuated: true },
-  ModelInfo { name: "whisper-medium", full_name: "whisper-medium", size: 831_538_144, languages: "99 languages", language_codes: WHISPER, punctuated: true },
-  ModelInfo { name: "whisper-large-v3", full_name: "whisper-large-v3", size: 1_668_741_440, languages: "100 languages", language_codes: WHISPER_V3, punctuated: true },
-  ModelInfo { name: "whisper-tiny.en", full_name: "whisper-tiny.en", size: 45_904_544, languages: "English", language_codes: EN, punctuated: true },
-  ModelInfo { name: "whisper-base.en", full_name: "whisper-base.en", size: 84_886_208, languages: "English", language_codes: EN, punctuated: true },
-  ModelInfo { name: "whisper-small.en", full_name: "whisper-small.en", size: 269_674_144, languages: "English", language_codes: EN, punctuated: true },
-  ModelInfo { name: "whisper-medium.en", full_name: "whisper-medium.en", size: 831_460_928, languages: "English", language_codes: EN, punctuated: true },
-  ModelInfo { name: "whisper-large", full_name: "whisper-large", size: 1_667_964_192, languages: "99 languages", language_codes: WHISPER, punctuated: true },
-  ModelInfo { name: "whisper-large-v2", full_name: "whisper-large-v2", size: 1_667_964_224, languages: "99 languages", language_codes: WHISPER, punctuated: true },
-  ModelInfo { name: "breeze-asr-25", full_name: "Breeze-ASR-25", size: 1_667_964_224, languages: "Taiwanese Mandarin and English", language_codes: WHISPER, punctuated: true },
-  ModelInfo { name: "moonshine-tiny", full_name: "moonshine-tiny", size: 35_466_912, languages: "English", language_codes: EN, punctuated: true },
-  ModelInfo { name: "moonshine-base", full_name: "moonshine-base", size: 77_476_480, languages: "English", language_codes: EN, punctuated: true },
+  ModelInfo { name: "parakeet-v3", full_name: "parakeet-tdt-0.6b-v3", size: 739_508_576, languages: "25 European languages", langs: PARAKEET_V3, punctuated: true },
+  ModelInfo { name: "parakeet-v2", full_name: "parakeet-tdt-0.6b-v2", size: 729_574_912, languages: "English", langs: EN, punctuated: true },
+  ModelInfo { name: "gigaam-v3", full_name: "gigaam-v3-e2e-rnnt", size: 273_724_832, languages: "Russian", langs: RU, punctuated: true },
+  ModelInfo { name: "gigaam-v3-e2e-ctc", full_name: "gigaam-v3-e2e-ctc", size: 272_151_136, languages: "Russian", langs: RU, punctuated: true },
+  ModelInfo { name: "gigaam-v3-rnnt", full_name: "gigaam-v3-rnnt", size: 273_022_880, languages: "Russian", langs: RU, punctuated: false },
+  ModelInfo { name: "gigaam-v3-ctc", full_name: "gigaam-v3-ctc", size: 271_803_328, languages: "Russian", langs: RU, punctuated: false },
+  ModelInfo { name: "whisper-turbo", full_name: "whisper-large-v3-turbo", size: 886_381_760, languages: "100 languages", langs: WHISPER_V3, punctuated: true },
+  ModelInfo { name: "whisper-tiny", full_name: "whisper-tiny", size: 45_981_088, languages: "99 languages", langs: WHISPER, punctuated: true },
+  ModelInfo { name: "whisper-base", full_name: "whisper-base", size: 84_962_880, languages: "99 languages", langs: WHISPER, punctuated: true },
+  ModelInfo { name: "whisper-small", full_name: "whisper-small", size: 269_751_136, languages: "99 languages", langs: WHISPER, punctuated: true },
+  ModelInfo { name: "whisper-medium", full_name: "whisper-medium", size: 831_538_144, languages: "99 languages", langs: WHISPER, punctuated: true },
+  ModelInfo { name: "whisper-large-v3", full_name: "whisper-large-v3", size: 1_668_741_440, languages: "100 languages", langs: WHISPER_V3, punctuated: true },
+  ModelInfo { name: "whisper-tiny.en", full_name: "whisper-tiny.en", size: 45_904_544, languages: "English", langs: EN, punctuated: true },
+  ModelInfo { name: "whisper-base.en", full_name: "whisper-base.en", size: 84_886_208, languages: "English", langs: EN, punctuated: true },
+  ModelInfo { name: "whisper-small.en", full_name: "whisper-small.en", size: 269_674_144, languages: "English", langs: EN, punctuated: true },
+  ModelInfo { name: "whisper-medium.en", full_name: "whisper-medium.en", size: 831_460_928, languages: "English", langs: EN, punctuated: true },
+  ModelInfo { name: "whisper-large", full_name: "whisper-large", size: 1_667_964_192, languages: "99 languages", langs: WHISPER, punctuated: true },
+  ModelInfo { name: "whisper-large-v2", full_name: "whisper-large-v2", size: 1_667_964_224, languages: "99 languages", langs: WHISPER, punctuated: true },
+  ModelInfo { name: "breeze-asr-25", full_name: "Breeze-ASR-25", size: 1_667_964_224, languages: "Taiwanese Mandarin and English", langs: WHISPER, punctuated: true },
+  ModelInfo { name: "moonshine-tiny", full_name: "moonshine-tiny", size: 35_466_912, languages: "English", langs: EN, punctuated: true },
+  ModelInfo { name: "moonshine-base", full_name: "moonshine-base", size: 77_476_480, languages: "English", langs: EN, punctuated: true },
 ];
 
 /// The model a short or full name stands for.
@@ -380,9 +380,9 @@ mod tests {
 
   /// `tests/models.rs` checks the codes against the GGUFs; this, that they agree with `languages`.
   #[test]
-  fn language_codes() {
+  fn langs() {
     for m in MODELS {
-      let codes = m.language_codes;
+      let codes = m.langs;
       assert!(!codes.is_empty(), "{}", m.name);
       for c in codes {
         let ok = (2..=3).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_lowercase());

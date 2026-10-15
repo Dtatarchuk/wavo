@@ -85,12 +85,12 @@ fn read_fixture(name: &str, sample: &str) -> (String, Option<Vec<(String, u32)>>
   (text.to_string(), Some(tokens), segments)
 }
 
-/// The GGUF's `general.languages` is the model's `language_codes` in `hub::MODELS`.
+/// The GGUF's `general.languages` is the model's `langs` in `hub::MODELS`.
 #[cfg(feature = "hub")]
 fn check_languages(name: &str, path: &Path) {
   let g = gguf::Gguf::open(path).unwrap();
   let codes: Vec<&str> = g.array("general.languages").unwrap();
-  assert_eq!(codes, wavo::hub::lookup(name).unwrap().language_codes, "{name}: general.languages");
+  assert_eq!(codes, wavo::hub::lookup(name).unwrap().langs, "{name}: general.languages");
 }
 
 fn check(name: &str, samples: &[&str]) {
