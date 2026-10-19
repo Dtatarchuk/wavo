@@ -277,8 +277,8 @@ impl Model {
   /// # Ok::<(), wavo::Error>(())
   /// ```
   pub fn transcribe(&self, pcm: &[f32]) -> Result<Transcript> {
-    // One pass over the whole audio: a little past the window still matches the split output
-    // (the 34-35 s fixtures), from ~45 s the tail is dropped or made up, and much longer audio
+    // One pass over the whole audio: a little past the window still matches the reference (the
+    // 34-35 s fixtures), from ~45 s the tail is dropped or made up, and much longer audio
     // overruns the GPU's 65 535 workgroups per dispatch.
     if let (Family::Gigaam(_) | Family::Moonshine(_), Some(window)) = (&self.0, self.max_audio_ms())
       && pcm.len() > window as usize * 3 / 2 * 16
@@ -286,6 +286,7 @@ impl Model {
       let ms = (pcm.len() as u64).div_ceil(16);
       return Err(Error::AudioTooLong { ms, max_ms: window * 3 / 2 });
     }
+
     match &self.0 {
       Family::Gigaam(m) => m.transcribe(pcm),
       Family::Parakeet(m) => m.transcribe(pcm),
