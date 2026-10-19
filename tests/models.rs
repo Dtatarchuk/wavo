@@ -100,18 +100,18 @@ fn check(name: &str, samples: &[&str]) {
   }
 }
 
-/// A clip longer than the model's `max_audio_ms` fails with `AudioTooLong`.
+/// A clip played twice, past 1.5 times the model's `max_audio_ms`, fails with `AudioTooLong`.
 fn too_long(name: &str, sample: &str) {
   let _gpu = GPU.lock().unwrap_or_else(PoisonError::into_inner);
   let root = Path::new(env!("CARGO_MANIFEST_DIR"));
   let model = wavo::Model::load(model_path(name)).unwrap();
-  let pcm = read_wav(&root.join(format!("3rd/transcribe.cpp/samples/{sample}.wav")));
+  let pcm = read_wav(&root.join(format!("3rd/transcribe.cpp/samples/{sample}.wav"))).repeat(2);
   let got = model.transcribe(&pcm);
   assert!(matches!(got, Err(wavo::Error::AudioTooLong { .. })), "{name} {sample}: {got:?}");
 }
 
-// ru-long (34 s) is past GigaAM's 25 s, dots (35 s) past Moonshine's 30 s.
-const GIGAAM: &[&str] = &["ru", "ru-short"];
+// ru-long (34 s) is past GigaAM's 25 s window but within the 37.5 s it takes.
+const GIGAAM: &[&str] = &["ru", "ru-short", "ru-long"];
 
 #[test]
 fn gigaam_v3_e2e_rnnt() {
@@ -214,12 +214,12 @@ fn breeze_asr_25() {
 
 #[test]
 fn moonshine_tiny() {
-  check("moonshine-tiny", &["jfk", "jobs-silence"]);
+  check("moonshine-tiny", &["jfk", "dots", "jobs-silence"]);
   too_long("moonshine-tiny", "dots");
 }
 
 #[test]
 fn moonshine_base() {
-  check("moonshine-base", &["jfk", "jobs-silence"]);
+  check("moonshine-base", &["jfk", "dots", "jobs-silence"]);
   too_long("moonshine-base", "dots");
 }

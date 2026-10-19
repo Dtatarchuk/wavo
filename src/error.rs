@@ -34,13 +34,14 @@ pub enum Error {
   /// dropped unfinished: some drivers cancel GPU work that runs for more than about 20 s.
   #[error("GPU: {0}")]
   Gpu(String),
-  /// The audio is longer than [`Model::max_audio_ms`](crate::Model::max_audio_ms) for a model
-  /// that runs it in one pass (GigaAM, Moonshine): split it first.
+  /// The audio is longer than 1.5 times [`Model::max_audio_ms`](crate::Model::max_audio_ms) for
+  /// a model that runs it in one pass (GigaAM, Moonshine): split it first.
   #[error("audio is {ms} ms, longer than the model's {max_ms} ms: split it at pauses")]
   AudioTooLong {
     /// The audio's length, in milliseconds, rounded up.
     ms: u64,
-    /// The model's [`max_audio_ms`](crate::Model::max_audio_ms).
+    /// The longest audio the model takes, in milliseconds: 1.5 times
+    /// [`max_audio_ms`](crate::Model::max_audio_ms).
     max_ms: u32,
   },
   /// A name that is neither a short nor a full name in [`hub::MODELS`](crate::hub::MODELS).
