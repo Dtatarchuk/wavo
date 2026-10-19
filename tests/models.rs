@@ -100,26 +100,41 @@ fn check(name: &str, samples: &[&str]) {
   }
 }
 
-const GIGAAM: &[&str] = &["ru", "ru-short", "ru-long"];
+/// A clip longer than the model's `max_audio_ms` fails with `AudioTooLong`.
+fn too_long(name: &str, sample: &str) {
+  let _gpu = GPU.lock().unwrap_or_else(PoisonError::into_inner);
+  let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+  let model = wavo::Model::load(model_path(name)).unwrap();
+  let pcm = read_wav(&root.join(format!("3rd/transcribe.cpp/samples/{sample}.wav")));
+  let got = model.transcribe(&pcm);
+  assert!(matches!(got, Err(wavo::Error::AudioTooLong { .. })), "{name} {sample}: {got:?}");
+}
+
+// ru-long (34 s) is past GigaAM's 25 s, dots (35 s) past Moonshine's 30 s.
+const GIGAAM: &[&str] = &["ru", "ru-short"];
 
 #[test]
 fn gigaam_v3_e2e_rnnt() {
   check("gigaam-v3-e2e-rnnt", GIGAAM);
+  too_long("gigaam-v3-e2e-rnnt", "ru-long");
 }
 
 #[test]
 fn gigaam_v3_e2e_ctc() {
   check("gigaam-v3-e2e-ctc", GIGAAM);
+  too_long("gigaam-v3-e2e-ctc", "ru-long");
 }
 
 #[test]
 fn gigaam_v3_rnnt() {
   check("gigaam-v3-rnnt", GIGAAM);
+  too_long("gigaam-v3-rnnt", "ru-long");
 }
 
 #[test]
 fn gigaam_v3_ctc() {
   check("gigaam-v3-ctc", GIGAAM);
+  too_long("gigaam-v3-ctc", "ru-long");
 }
 
 #[test]
@@ -199,10 +214,12 @@ fn breeze_asr_25() {
 
 #[test]
 fn moonshine_tiny() {
-  check("moonshine-tiny", &["jfk", "dots", "jobs-silence"]);
+  check("moonshine-tiny", &["jfk", "jobs-silence"]);
+  too_long("moonshine-tiny", "dots");
 }
 
 #[test]
 fn moonshine_base() {
-  check("moonshine-base", &["jfk", "dots", "jobs-silence"]);
+  check("moonshine-base", &["jfk", "jobs-silence"]);
+  too_long("moonshine-base", "dots");
 }

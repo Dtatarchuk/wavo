@@ -35,7 +35,8 @@ Run options:
   --srt                        print subtitles
   --segment SECS               split longer audio at pauses into parts of up to SECS
                                (25 for GigaAM, 30 for Whisper and Moonshine, else 60;
-                               0 for one pass)
+                               0 for one pass; GigaAM and Moonshine take no more than
+                               their default)
   -y, --yes                    download a missing model without asking
 
 MODEL is a name below, its full name or a path to a .gguf file. AUDIO is wav, mp3, m4a, flac
